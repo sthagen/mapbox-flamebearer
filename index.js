@@ -98,37 +98,47 @@ export function parseCpuProfile(data, name) {
     }, name);
 }
 
+const IDLE_SAMPLE_NAMES = new Set(['(idle)', '(program)']);
+
 function buildThread({nodes, samples, timeDeltas, startTime}, name) {
-    const selfByFrame = new Map();
     const sampleTimes = new Array(samples.length);
     const sampleFrames = new Array(samples.length);
-    let busy = 0;
-    let idle = 0;
     let t = startTime;
-
     for (let i = 0; i < samples.length; i++) {
-        const dt = timeDeltas[i] || 0;
-        t += dt;
+        t += timeDeltas[i] || 0;
         sampleTimes[i] = t;
-
         const node = nodes.get(samples[i]);
-        if (!node) continue;
-        sampleFrames[i] = node.callFrame;
+        if (node) sampleFrames[i] = node.callFrame;
+    }
+    return {name, sampleTimes, sampleFrames, startTime,
+        ...aggregate(sampleTimes, sampleFrames, startTime, -Infinity, Infinity)};
+}
 
-        const fname = node.callFrame.functionName;
-        if (fname === '(idle)' || fname === '(program)') {
+function aggregate(sampleTimes, sampleFrames, startTime, fromUs, toUs) {
+    const selfByFrame = new Map();
+    let busy = 0, idle = 0, samples = 0;
+    let prev = startTime;
+    for (let i = 0; i < sampleTimes.length; i++) {
+        const ts = sampleTimes[i];
+        const dt = ts - prev;
+        prev = ts;
+        if (ts < fromUs) continue;
+        if (ts > toUs) break;
+        samples++;
+        const f = sampleFrames[i];
+        if (!f) continue;
+        if (IDLE_SAMPLE_NAMES.has(f.functionName)) {
             idle += dt;
         } else {
             busy += dt;
-            const key = frameKey(node.callFrame);
+            const key = frameKey(f);
             const entry = selfByFrame.get(key);
             if (entry) entry.time += dt;
-            else selfByFrame.set(key, {frame: node.callFrame, time: dt});
+            else selfByFrame.set(key, {frame: f, time: dt});
         }
     }
-
     const top = [...selfByFrame.values()].sort((a, b) => b.time - a.time);
-    return {name, samples: samples.length, busy, idle, top, sampleTimes, sampleFrames, startTime};
+    return {samples, busy, idle, top};
 }
 
 function frameKey(f) {
@@ -156,9 +166,7 @@ function dominantFrame(thread, fromUs, toUs) {
         if (ts < fromUs) continue;
         if (ts > toUs) break;
         const f = sampleFrames[i];
-        if (!f) continue;
-        const name = f.functionName;
-        if (name === '(idle)' || name === '(program)') continue;
+        if (!f || IDLE_SAMPLE_NAMES.has(f.functionName)) continue;
         const key = frameKey(f);
         const count = (byFrame.get(key) || 0) + 1;
         byFrame.set(key, count);
@@ -225,34 +233,12 @@ export function filterTrace(trace, {from, to, threads} = {}) {
 }
 
 function sliceThread(t, fromUs, toUs) {
-    const selfByFrame = new Map();
-    let busy = 0, idle = 0, samples = 0;
-    let prev = t.startTime;
-    for (let i = 0; i < t.sampleTimes.length; i++) {
-        const ts = t.sampleTimes[i];
-        const dt = ts - prev;
-        prev = ts;
-        if (ts < fromUs || ts > toUs) continue;
-        samples++;
-        const f = t.sampleFrames[i];
-        if (!f) continue;
-        const fname = f.functionName;
-        if (fname === '(idle)' || fname === '(program)') {
-            idle += dt;
-        } else {
-            busy += dt;
-            const key = frameKey(f);
-            const entry = selfByFrame.get(key);
-            if (entry) entry.time += dt;
-            else selfByFrame.set(key, {frame: f, time: dt});
-        }
-    }
-    const top = [...selfByFrame.values()].sort((a, b) => b.time - a.time);
+    const agg = aggregate(t.sampleTimes, t.sampleFrames, t.startTime, fromUs, toUs);
     const longTasks = t.longTasks?.filter(lt => lt.ts >= fromUs && lt.ts + lt.dur <= toUs);
     const breakdown = t.events ?
-        computeBreakdown(t.events.filter(e => e.ts >= fromUs && e.ts + e.dur <= toUs), busy + idle) :
+        computeBreakdown(t.events.filter(e => e.ts >= fromUs && e.ts + e.dur <= toUs), agg.busy + agg.idle) :
         t.breakdown;
-    return {...t, samples, busy, idle, top, longTasks, breakdown};
+    return {...t, ...agg, longTasks, breakdown};
 }
 
 export function resolveSourceMaps(trace, {load = loadSiblingMap} = {}) {
@@ -438,6 +424,11 @@ export function formatReport(input, {top = 20, color = false, sourceMaps = true,
     const minUs = minDuration * 1000;
     const paint = makePainter(color);
     const hotThreshold = 5;
+    const fmtPct = (p) => {
+        const s = `${p.toFixed(1)}%`;
+        return p >= hotThreshold ? paint(s, 'boldRed') : s;
+    };
+    const fmtMs = us => `${(us / 1000).toFixed(1)} ms`;
 
     const urlCounts = new Map();
     for (const t of trace.threads) {
@@ -466,12 +457,6 @@ export function formatReport(input, {top = 20, color = false, sourceMaps = true,
         out.push('');
         out.push(paint(`=== ${t.name} ===`, 'bold'));
         out.push(`samples: ${t.samples}  busy: ${busyMs.toFixed(1)} ms  idle: ${idleMs.toFixed(1)} ms`);
-
-        const fmtPct = (p) => {
-            const s = `${p.toFixed(1)}%`;
-            return p >= hotThreshold ? paint(s, 'boldRed') : s;
-        };
-        const fmtMs = us => `${(us / 1000).toFixed(1)} ms`;
 
         if (t.breakdown?.length) {
             const parts = t.breakdown
@@ -508,10 +493,7 @@ export function formatReport(input, {top = 20, color = false, sourceMaps = true,
 }
 
 function parseOrigin(url) {
-    if (!url) return null;
-    const blob = url.match(/^blob:[a-z][a-z-]*:\/\/[^/]*/);
-    if (blob) return blob[0];
-    const m = url.match(/^[a-z][a-z-]*:\/\/[^/]*/);
+    const m = url?.match(/^(?:blob:)?[a-z][a-z-]*:\/\/[^/]*/);
     return m ? m[0] : null;
 }
 
