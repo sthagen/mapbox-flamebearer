@@ -69,11 +69,16 @@ function frameKey(f) {
     return `${f.functionName}|${f.url || ''}|${f.lineNumber || 0}|${f.columnNumber || 0}`;
 }
 
-export function formatFrame(f, shorten) {
+export function formatFrame(f, shorten, paint) {
     const name = f.functionName || '(anonymous)';
     if (!f.url) return name;
     const loc = f.lineNumber >= 0 ? `:${f.lineNumber + 1}` : '';
-    return `${name}  ${shorten ? shorten(f.url) : f.url}${loc}`;
+    return `${name}  ${paint(`${shorten ? shorten(f.url) : f.url}${loc}`, 'dim')}`;
+}
+
+const ANSI = {bold: '1', dim: '2', red: '31', boldRed: '1;31'};
+function makePainter(on) {
+    return on ? (s, style) => `\x1b[${ANSI[style]}m${s}\x1b[0m` : s => s;
 }
 
 export function buildShortener(urlCounts, threshold = 0.8) {
@@ -131,7 +136,10 @@ export function buildShortener(urlCounts, threshold = 0.8) {
     return {shorten, sources};
 }
 
-export function formatReport(trace, {top = 20} = {}) {
+export function formatReport(trace, {top = 20, color = false} = {}) {
+    const paint = makePainter(color);
+    const hotThreshold = 5;
+
     const urlCounts = new Map();
     for (const t of trace.threads) {
         for (let i = 0; i < Math.min(top, t.top.length); i++) {
@@ -143,9 +151,9 @@ export function formatReport(trace, {top = 20} = {}) {
 
     const out = [];
     if (sources.length) {
-        out.push('Sources:');
+        out.push(paint('Sources:', 'bold'));
         for (const {tag, prefix} of sources) {
-            out.push(`  ${tag ? `[${tag}]`.padEnd(20) : ' '.repeat(20)}  ${prefix}`);
+            out.push(`  ${tag ? `[${tag}]`.padEnd(20) : ' '.repeat(20)}  ${paint(prefix, 'dim')}`);
         }
     }
 
@@ -155,16 +163,18 @@ export function formatReport(trace, {top = 20} = {}) {
         const totalUs = t.busy + t.idle;
 
         out.push('');
-        out.push(`=== ${t.name} ===`);
-        out.push(`samples: ${t.samples}   busy: ${busyMs.toFixed(1)} ms   idle: ${idleMs.toFixed(1)} ms`);
+        out.push(paint(`=== ${t.name} ===`, 'bold'));
+        out.push(`samples: ${t.samples}  busy: ${busyMs.toFixed(1)} ms  idle: ${idleMs.toFixed(1)} ms`);
         out.push('');
-        out.push('Top CPU (self time):');
+        out.push(paint('Top CPU (self time):', 'bold'));
 
         for (let i = 0; i < Math.min(top, t.top.length); i++) {
             const {frame, time} = t.top[i];
             const ms = (time / 1000).toFixed(1).padStart(7);
-            const pct = (totalUs > 0 ? (100 * time / totalUs).toFixed(1) : '0.0').padStart(5);
-            out.push(`${ms} ms  ${pct}%  ${formatFrame(frame, shorten)}`);
+            const pctNum = totalUs > 0 ? 100 * time / totalUs : 0;
+            const pct = pctNum.toFixed(1).padStart(4);
+            const pctText = pctNum >= hotThreshold ? paint(`${pct}%`, 'boldRed') : `${pct}%`;
+            out.push(`${ms} ms  ${pctText}  ${formatFrame(frame, shorten, paint)}`);
         }
     }
 

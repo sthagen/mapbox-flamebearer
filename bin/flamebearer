@@ -2,10 +2,13 @@
 import fs from 'node:fs';
 import {parseTrace, formatReport} from '../index.js';
 
-const file = process.argv[2];
+const args = process.argv.slice(2);
+const file = args.find(a => !a.startsWith('--'));
 if (!file) {
-    console.error('usage: flamebearer <trace.json[.gz]>');
+    console.error('usage: flamebearer <trace.json[.gz]> [--color | --no-color]');
     process.exit(1);
 }
 
-console.log(formatReport(parseTrace(fs.readFileSync(file))));
+const color = args.includes('--color') || (!args.includes('--no-color') && process.stdout.isTTY && !process.env.NO_COLOR);
+
+console.log(formatReport(parseTrace(fs.readFileSync(file)), {color}));
