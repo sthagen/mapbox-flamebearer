@@ -265,14 +265,31 @@ function loadSiblingMap(url) {
     } catch { return null; }
 }
 
-export function formatFrame(f, shorten, paint) {
-    const name = f.functionName || '(anonymous)';
-    if (!f.url) return name;
-    const loc = f.lineNumber >= 0 ? `:${f.lineNumber + 1}` : '';
-    return `${name}  ${paint(`${shorten ? shorten(f.url) : f.url}${loc}`, 'dim')}`;
+const IDLE_NAMES = new Set(['(idle)', '(program)', '(root)', '(no symbol)']);
+
+export function frameKind(f) {
+    if (f.functionName === '(garbage collector)') return 'gc';
+    if (IDLE_NAMES.has(f.functionName)) return 'system';
+    const url = f.url;
+    if (!url) return 'native';
+    if (url.startsWith('node:')) return 'node';
+    if (url.includes('/node_modules/')) return 'deps';
+    if (url.startsWith('chrome-extension://')) return 'ext';
+    return 'user';
 }
 
-const ANSI = {bold: '1', dim: '2', red: '31', boldRed: '1;31'};
+const KIND_COLORS = {user: 'green', deps: 'cyan', node: 'blue', ext: 'magenta', native: 'yellow', gc: 'yellow', system: 'dim'};
+
+export function formatFrame(f, shorten, paint) {
+    const name = f.functionName || '(anonymous)';
+    const color = KIND_COLORS[frameKind(f)];
+    const coloredName = paint(name, color);
+    if (!f.url) return coloredName;
+    const loc = f.lineNumber >= 0 ? `:${f.lineNumber + 1}` : '';
+    return `${coloredName}  ${paint(`${shorten ? shorten(f.url) : f.url}${loc}`, 'dim')}`;
+}
+
+const ANSI = {bold: '1', dim: '2', red: '31', green: '32', yellow: '33', blue: '34', magenta: '35', cyan: '36', boldRed: '1;31'};
 function makePainter(on) {
     return on ? (s, style) => `\x1b[${ANSI[style]}m${s}\x1b[0m` : s => s;
 }
@@ -395,7 +412,7 @@ export function formatReport(input, {top = 20, color = false, sourceMaps = true}
         if (t.breakdown?.length) {
             const parts = t.breakdown
                 .filter(b => b.pct >= 1)
-                .map(b => `${b.category} ${b.category === 'scripting' ? `${b.pct.toFixed(1)}%` : fmtPct(b.pct)}`);
+                .map(b => `${b.category} ${b.pct.toFixed(1)}%`);
             if (parts.length) out.push(parts.join('  '));
         }
 
