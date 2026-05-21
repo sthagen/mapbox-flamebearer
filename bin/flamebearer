@@ -1,29 +1,54 @@
 #!/usr/bin/env node
-import fs from 'node:fs';
-import path from 'node:path';
-import {parseInput, formatReport} from '../index.js';
+import {loadInputs, formatReport} from '../index.js';
+
+const HELP = `usage: flamebearer <input>... [options]
+
+inputs: .json / .json.gz Chrome trace, .cpuprofile, or a directory of
+        .cpuprofile files. Multiple inputs merge as additional threads.
+
+filtering:
+  --from <ms>           start of time range (relative to each thread's start)
+  --to <ms>             end of time range
+  --thread <name>       restrict to threads whose name contains <name>
+                        (repeatable; matched case-insensitively)
+  --top <N>             show at most N rows in Top CPU (default 20)
+  --min-duration <ms>   hide Top CPU rows and long tasks shorter than <ms>
+
+output:
+  --color / --no-color  force ANSI color (default: on if TTY and !$NO_COLOR)
+  --no-sourcemap        skip sibling .map / embedded sourcemap resolution
+  --help, -h            show this help`;
 
 const args = process.argv.slice(2);
-const inputs = args.filter(a => !a.startsWith('--'));
-if (!inputs.length) {
-    console.error('usage: flamebearer <trace.json[.gz] | file.cpuprofile | dir>... [--color | --no-color] [--no-sourcemap]');
-    process.exit(1);
+if (!args.length || args.includes('--help') || args.includes('-h')) {
+    console.log(HELP);
+    process.exit(args.length ? 0 : 1);
 }
 
-const color = args.includes('--color') || (!args.includes('--no-color') && process.stdout.isTTY && !process.env.NO_COLOR);
-const sourceMaps = !args.includes('--no-sourcemap');
+const inputs = [];
+const threads = [];
+const opts = {};
+let colorFlag = null;
 
-const files = [];
-for (const input of inputs) {
-    const stat = fs.statSync(input);
-    if (stat.isDirectory()) {
-        for (const name of fs.readdirSync(input).sort()) {
-            if (name.endsWith('.cpuprofile')) files.push(path.join(input, name));
-        }
-    } else {
-        files.push(input);
-    }
+for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const next = () => {
+        if (i + 1 >= args.length) { console.error(`missing value for ${a}`); process.exit(2); }
+        return args[++i];
+    };
+    if (a === '--color') colorFlag = true;
+    else if (a === '--no-color') colorFlag = false;
+    else if (a === '--no-sourcemap') opts.sourceMaps = false;
+    else if (a === '--from') opts.from = Number(next());
+    else if (a === '--to') opts.to = Number(next());
+    else if (a === '--thread') threads.push(next());
+    else if (a === '--top') opts.top = Number(next());
+    else if (a === '--min-duration') opts.minDuration = Number(next());
+    else if (a.startsWith('--')) { console.error(`unknown option: ${a}`); process.exit(2); } else inputs.push(a);
 }
 
-const traces = files.map(f => parseInput(fs.readFileSync(f), f));
-console.log(formatReport(traces, {color, sourceMaps}));
+opts.threads = threads;
+opts.color = colorFlag ?? (process.stdout.isTTY && !process.env.NO_COLOR);
+
+console.log(formatReport(loadInputs(inputs), opts));
+console.log('\n(filters: --top N --thread NAME --from/--to MS --min-duration MS; --help for all)');

@@ -78,6 +78,7 @@ export function parseTrace(data) {
 
         const events = mainEventsByThread.get(p.key);
         if (events) {
+            t.events = events;
             t.longTasks = findLongTasks(events, t);
             t.breakdown = computeBreakdown(events, t.busy + t.idle);
         }
@@ -205,6 +206,53 @@ function computeBreakdown(events, totalUs) {
     return [...buckets.entries()]
         .map(([category, time]) => ({category, time, pct: totalUs > 0 ? 100 * time / totalUs : 0}))
         .sort((a, b) => b.time - a.time);
+}
+
+export function filterTrace(trace, {from, to, threads} = {}) {
+    let selected = trace.threads;
+    if (threads?.length) {
+        const needles = threads.map(s => s.toLowerCase());
+        selected = selected.filter(t => needles.some(n => t.name.toLowerCase().includes(n)));
+    }
+    if (from == null && to == null) return {...trace, threads: selected};
+
+    const sliced = selected.map((t) => {
+        const fromUs = from != null ? t.startTime + from * 1000 : -Infinity;
+        const toUs = to != null ? t.startTime + to * 1000 : Infinity;
+        return sliceThread(t, fromUs, toUs);
+    });
+    return {...trace, threads: sliced};
+}
+
+function sliceThread(t, fromUs, toUs) {
+    const selfByFrame = new Map();
+    let busy = 0, idle = 0, samples = 0;
+    let prev = t.startTime;
+    for (let i = 0; i < t.sampleTimes.length; i++) {
+        const ts = t.sampleTimes[i];
+        const dt = ts - prev;
+        prev = ts;
+        if (ts < fromUs || ts > toUs) continue;
+        samples++;
+        const f = t.sampleFrames[i];
+        if (!f) continue;
+        const fname = f.functionName;
+        if (fname === '(idle)' || fname === '(program)') {
+            idle += dt;
+        } else {
+            busy += dt;
+            const key = frameKey(f);
+            const entry = selfByFrame.get(key);
+            if (entry) entry.time += dt;
+            else selfByFrame.set(key, {frame: f, time: dt});
+        }
+    }
+    const top = [...selfByFrame.values()].sort((a, b) => b.time - a.time);
+    const longTasks = t.longTasks?.filter(lt => lt.ts >= fromUs && lt.ts + lt.dur <= toUs);
+    const breakdown = t.events ?
+        computeBreakdown(t.events.filter(e => e.ts >= fromUs && e.ts + e.dur <= toUs), busy + idle) :
+        t.breakdown;
+    return {...t, samples, busy, idle, top, longTasks, breakdown};
 }
 
 export function resolveSourceMaps(trace, {load = loadSiblingMap} = {}) {
@@ -369,9 +417,25 @@ export function buildShortener(urlCounts, threshold = 0.8) {
     return {shorten, sources};
 }
 
-export function formatReport(input, {top = 20, color = false, sourceMaps = true} = {}) {
-    const trace = Array.isArray(input) ? mergeTraces(input) : input;
+export function loadInputs(paths) {
+    const files = [];
+    for (const p of paths) {
+        if (fs.statSync(p).isDirectory()) {
+            for (const name of fs.readdirSync(p).sort()) {
+                if (name.endsWith('.cpuprofile')) files.push(path.join(p, name));
+            }
+        } else {
+            files.push(p);
+        }
+    }
+    return files.map(f => parseInput(fs.readFileSync(f), f));
+}
+
+export function formatReport(input, {top = 20, color = false, sourceMaps = true, minDuration = 0, from, to, threads} = {}) {
+    let trace = Array.isArray(input) ? mergeTraces(input) : input;
+    if (from != null || to != null || threads?.length) trace = filterTrace(trace, {from, to, threads});
     if (sourceMaps) resolveSourceMaps(trace);
+    const minUs = minDuration * 1000;
     const paint = makePainter(color);
     const hotThreshold = 5;
 
@@ -419,17 +483,19 @@ export function formatReport(input, {top = 20, color = false, sourceMaps = true}
         out.push('');
         out.push(paint('Top CPU (self time):', 'bold'));
         const topRows = [];
-        for (let i = 0; i < Math.min(top, t.top.length); i++) {
+        for (let i = 0; i < t.top.length && topRows.length < top; i++) {
             const {frame, time} = t.top[i];
+            if (time < minUs) break;
             const pct = totalUs > 0 ? 100 * time / totalUs : 0;
             topRows.push([fmtMs(time), fmtPct(pct), formatFrame(frame, shorten, paint)]);
         }
         for (const line of table(topRows, ['right', 'right', 'left'])) out.push(line);
 
-        if (t.longTasks?.length) {
+        const longTasks = t.longTasks?.filter(lt => lt.dur >= minUs);
+        if (longTasks?.length) {
             out.push('');
-            out.push(paint(`Long tasks (>50ms): ${t.longTasks.length}`, 'bold'));
-            const rows = t.longTasks.map(({ts, dur, dominant}) => [
+            out.push(paint(`Long tasks (>50ms): ${longTasks.length}`, 'bold'));
+            const rows = longTasks.map(({ts, dur, dominant}) => [
                 `t=${((ts - t.startTime) / 1000).toFixed(0)}ms`,
                 `${(dur / 1000).toFixed(0)} ms`,
                 dominant ? formatFrame(dominant, shorten, paint) : '—'
