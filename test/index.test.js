@@ -1,7 +1,8 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import {parseInput, parseTrace, parseCpuProfile, buildShortener, formatReport} from '../index.js';
+import {TraceMap} from '@jridgewell/trace-mapping';
+import {parseInput, parseTrace, parseCpuProfile, buildShortener, formatReport, resolveSourceMaps} from '../index.js';
 
 const tinyCpuProfile = {
     nodes: [
@@ -96,6 +97,82 @@ test('buildShortener tags chrome-extension with truncated id', () => {
     ]);
     const {shorten} = buildShortener(counts);
     assert.match(shorten('chrome-extension://aeblfdkhhhdcdjpifhhbdiojplfjncoa/inline/injected.js'), /^\[ext:aeblfd\]/);
+});
+
+test('resolveSourceMaps remaps frames via injected loader', () => {
+    const map = new TraceMap({
+        version: 3,
+        sources: ['../src/index.ts'],
+        names: ['myFunc'],
+        mappings: 'AAAAA'
+    }, 'file:///bundle/foo.js.map');
+    const load = url => (url === 'file:///bundle/foo.js' ? map : null);
+
+    const trace = {threads: [{
+        top: [{frame: {functionName: '(anonymous)', url: 'file:///bundle/foo.js', lineNumber: 0, columnNumber: 0}, time: 100}],
+        longTasks: [{ts: 0, dur: 0, dominant: {functionName: 'x', url: 'file:///bundle/foo.js', lineNumber: 0, columnNumber: 0}}]
+    }]};
+    resolveSourceMaps(trace, {load});
+
+    const f = trace.threads[0].top[0].frame;
+    assert.match(f.url, /index\.ts$/);
+    assert.equal(f.lineNumber, 0);
+    assert.equal(f.functionName, 'myFunc');
+
+    const lt = trace.threads[0].longTasks[0].dominant;
+    assert.match(lt.url, /index\.ts$/);
+    assert.equal(lt.functionName, 'x'); // not anonymous, name preserved
+});
+
+test('parseTrace collects embedded sourcemaps from metadata; resolveSourceMaps applies them', () => {
+    const data = {
+        metadata: {
+            sourceMaps: [{
+                url: 'http://example.com/bundle.js',
+                sourceMapUrl: 'http://example.com/bundle.js.map',
+                sourceMap: {version: 3, sources: ['../src/index.ts'], names: ['myFunc'], mappings: 'AAAAA'}
+            }]
+        },
+        traceEvents: [
+            {name: 'Profile', id: '0xp', pid: 1, tid: 2, args: {data: {startTime: 0}}},
+            {name: 'ProfileChunk', id: '0xp', pid: 1, tid: 2, args: {data: {
+                cpuProfile: {
+                    nodes: [
+                        {id: 1, callFrame: {functionName: '(root)', url: '', lineNumber: -1, columnNumber: -1}},
+                        {id: 2, callFrame: {functionName: '(anonymous)', url: 'http://example.com/bundle.js', lineNumber: 0, columnNumber: 0}}
+                    ],
+                    samples: [2]
+                },
+                timeDeltas: [1000]
+            }}}
+        ]
+    };
+
+    const trace = parseTrace(data);
+    assert.ok(trace.embeddedMaps.has('http://example.com/bundle.js'));
+
+    resolveSourceMaps(trace);
+    const f = trace.threads[0].top[0].frame;
+    assert.match(f.url, /index\.ts$/);
+    assert.equal(f.functionName, 'myFunc');
+});
+
+test('resolveSourceMaps picks up inline data-URL maps from source files', () => {
+    const tmp = fs.mkdtempSync('/tmp/fb-sm-');
+    const jsPath = `${tmp}/bundle.js`;
+    const rawMap = JSON.stringify({version: 3, sources: ['../src/index.ts'], names: ['myFunc'], mappings: 'AAAAA'});
+    const b64 = Buffer.from(rawMap).toString('base64');
+    fs.writeFileSync(jsPath, `function a(){}\n//# sourceMappingURL=data:application/json;base64,${b64}\n`);
+
+    const trace = {threads: [{
+        top: [{frame: {functionName: '(anonymous)', url: `file://${jsPath}`, lineNumber: 0, columnNumber: 0}, time: 100}]
+    }]};
+    resolveSourceMaps(trace);
+
+    const f = trace.threads[0].top[0].frame;
+    assert.match(f.url, /index\.ts$/);
+    assert.equal(f.functionName, 'myFunc');
+    fs.rmSync(tmp, {recursive: true});
 });
 
 test('formatReport runs on both fixture types and includes key sections', () => {

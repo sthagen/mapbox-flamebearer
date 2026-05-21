@@ -29,5 +29,8 @@
     "traces"
   ],
   "author": "Volodymyr Agafonkin",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "@jridgewell/trace-mapping": "^0.3.31"
+  }
 }

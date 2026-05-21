@@ -1,5 +1,8 @@
 import zlib from 'node:zlib';
 import path from 'node:path';
+import fs from 'node:fs';
+import {fileURLToPath, pathToFileURL} from 'node:url';
+import {TraceMap, originalPositionFor} from '@jridgewell/trace-mapping';
 
 export function parseInput(buf, filename) {
     if (buf[0] === 0x1f && buf[1] === 0x8b) buf = zlib.gunzipSync(buf);
@@ -12,8 +15,22 @@ export function parseInput(buf, filename) {
     return parseTrace(data);
 }
 
+export function mergeTraces(traces) {
+    const embeddedMaps = new Map();
+    for (const t of traces) if (t.embeddedMaps) for (const [k, v] of t.embeddedMaps) embeddedMaps.set(k, v);
+    return {
+        source: traces.length === 1 ? traces[0].source : 'mixed',
+        threads: traces.flatMap(t => t.threads),
+        embeddedMaps
+    };
+}
+
 export function parseTrace(data) {
     const events = data.traceEvents || data;
+    const embeddedMaps = new Map();
+    for (const sm of data.metadata?.sourceMaps || []) {
+        if (sm.url && sm.sourceMap?.mappings) embeddedMaps.set(sm.url, sm.sourceMap);
+    }
 
     const threadNames = new Map();
     const profiles = new Map();
@@ -64,7 +81,7 @@ export function parseTrace(data) {
         }
         threads.push(t);
     }
-    return {source: 'chrome', threads};
+    return {source: 'chrome', threads, embeddedMaps};
 }
 
 export function parseCpuProfile(data, name) {
@@ -188,6 +205,65 @@ function computeBreakdown(events, totalUs) {
         .sort((a, b) => b.time - a.time);
 }
 
+export function resolveSourceMaps(trace, {load = loadSiblingMap} = {}) {
+    const cache = new Map();
+    const seen = new WeakSet();
+    const embedded = trace.embeddedMaps;
+
+    const remap = (frame) => {
+        if (!frame || seen.has(frame) || !frame.url || frame.lineNumber < 0) return;
+        seen.add(frame);
+
+        let map = cache.get(frame.url);
+        if (map === undefined) {
+            const raw = embedded?.get(frame.url);
+            map = raw ? new TraceMap(raw) : load(frame.url);
+            cache.set(frame.url, map);
+        }
+        if (!map) return;
+
+        const pos = originalPositionFor(map, {line: frame.lineNumber + 1, column: frame.columnNumber || 0});
+        if (!pos.source || pos.line == null) return;
+
+        frame.url = pos.source;
+        frame.lineNumber = pos.line - 1;
+        frame.columnNumber = pos.column || 0;
+        if (pos.name && (!frame.functionName || frame.functionName === '(anonymous)')) {
+            frame.functionName = pos.name;
+        }
+    };
+
+    for (const t of trace.threads) {
+        for (const e of t.top) remap(e.frame);
+        if (t.longTasks) for (const lt of t.longTasks) remap(lt.dominant);
+    }
+}
+
+function loadSiblingMap(url) {
+    if (!url.startsWith('file://')) return null;
+    let filePath;
+    try { filePath = fileURLToPath(url); } catch { return null; }
+
+    const mapPath = `${filePath}.map`;
+    if (fs.existsSync(mapPath)) {
+        try {
+            const raw = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
+            return new TraceMap(raw, pathToFileURL(mapPath).href);
+        } catch { /* fall through to inline */ }
+    }
+
+    if (!fs.existsSync(filePath)) return null;
+    try {
+        const src = fs.readFileSync(filePath, 'utf8');
+        const i = src.lastIndexOf('sourceMappingURL=');
+        if (i < 0) return null;
+        const m = src.slice(i).match(/^sourceMappingURL=data:application\/json(?:;charset=[^;,]+)?;base64,([A-Za-z0-9+/=]+)/);
+        if (!m) return null;
+        const raw = JSON.parse(Buffer.from(m[1], 'base64').toString('utf8'));
+        return new TraceMap(raw, pathToFileURL(filePath).href);
+    } catch { return null; }
+}
+
 export function formatFrame(f, shorten, paint) {
     const name = f.functionName || '(anonymous)';
     if (!f.url) return name;
@@ -251,7 +327,7 @@ export function buildShortener(urlCounts, threshold = 0.8) {
             if (w >= min && prefix.length > best.length) best = prefix;
         }
         prefixes.set(origin, best);
-        if (total > dominantWeight) {
+        if (total > dominantWeight && !origin.startsWith('blob:')) {
             dominantWeight = total;
             dominant = origin;
         }
@@ -266,14 +342,18 @@ export function buildShortener(urlCounts, threshold = 0.8) {
         const origin = parseOrigin(url);
         if (!origin) return url;
         const prefix = prefixes.get(origin);
-        const path = prefix && url.startsWith(prefix) ? url.slice(prefix.length) : url.slice(origin.length);
-        return origin === dominant ? path : `[${originTag(origin)}] ${path}`;
+        const isBlob = origin.startsWith('blob:');
+        const path = isBlob ? '' :
+            prefix && url.startsWith(prefix) ? url.slice(prefix.length) : url.slice(origin.length);
+        return origin === dominant ? path : `[${originTag(origin)}]${path && ` ${path}`}`;
     }
 
     return {shorten, sources};
 }
 
-export function formatReport(trace, {top = 20, color = false} = {}) {
+export function formatReport(input, {top = 20, color = false, sourceMaps = true} = {}) {
+    const trace = Array.isArray(input) ? mergeTraces(input) : input;
+    if (sourceMaps) resolveSourceMaps(trace);
     const paint = makePainter(color);
     const hotThreshold = 5;
 
@@ -345,6 +425,8 @@ export function formatReport(trace, {top = 20, color = false} = {}) {
 
 function parseOrigin(url) {
     if (!url) return null;
+    const blob = url.match(/^blob:[a-z][a-z-]*:\/\/[^/]*/);
+    if (blob) return blob[0];
     const m = url.match(/^[a-z][a-z-]*:\/\/[^/]*/);
     return m ? m[0] : null;
 }
@@ -352,5 +434,6 @@ function parseOrigin(url) {
 function originTag(origin) {
     const ext = origin.match(/^chrome-extension:\/\/([a-p]{6})/);
     if (ext) return `ext:${ext[1]}`;
+    if (origin.startsWith('blob:')) return 'blob';
     return origin.replace(/^https?:\/\//, '');
 }

@@ -6,11 +6,12 @@ import {parseInput, formatReport} from '../index.js';
 const args = process.argv.slice(2);
 const inputs = args.filter(a => !a.startsWith('--'));
 if (!inputs.length) {
-    console.error('usage: flamebearer <trace.json[.gz] | file.cpuprofile | dir>... [--color | --no-color]');
+    console.error('usage: flamebearer <trace.json[.gz] | file.cpuprofile | dir>... [--color | --no-color] [--no-sourcemap]');
     process.exit(1);
 }
 
 const color = args.includes('--color') || (!args.includes('--no-color') && process.stdout.isTTY && !process.env.NO_COLOR);
+const sourceMaps = !args.includes('--no-sourcemap');
 
 const files = [];
 for (const input of inputs) {
@@ -25,9 +26,4 @@ for (const input of inputs) {
 }
 
 const traces = files.map(f => parseInput(fs.readFileSync(f), f));
-const merged = {
-    source: traces.length === 1 ? traces[0].source : 'mixed',
-    threads: traces.flatMap(t => t.threads)
-};
-
-console.log(formatReport(merged, {color}));
+console.log(formatReport(traces, {color, sourceMaps}));
