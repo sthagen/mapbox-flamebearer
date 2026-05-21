@@ -1,4 +1,2 @@
-samples
-*.log
-flamegraph.html
+*.json.gz
 node_modules
