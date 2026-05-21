@@ -1,14 +1,33 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
-import {parseTrace, formatReport} from '../index.js';
+import path from 'node:path';
+import {parseInput, formatReport} from '../index.js';
 
 const args = process.argv.slice(2);
-const file = args.find(a => !a.startsWith('--'));
-if (!file) {
-    console.error('usage: flamebearer <trace.json[.gz]> [--color | --no-color]');
+const inputs = args.filter(a => !a.startsWith('--'));
+if (!inputs.length) {
+    console.error('usage: flamebearer <trace.json[.gz] | file.cpuprofile | dir>... [--color | --no-color]');
     process.exit(1);
 }
 
 const color = args.includes('--color') || (!args.includes('--no-color') && process.stdout.isTTY && !process.env.NO_COLOR);
 
-console.log(formatReport(parseTrace(fs.readFileSync(file)), {color}));
+const files = [];
+for (const input of inputs) {
+    const stat = fs.statSync(input);
+    if (stat.isDirectory()) {
+        for (const name of fs.readdirSync(input).sort()) {
+            if (name.endsWith('.cpuprofile')) files.push(path.join(input, name));
+        }
+    } else {
+        files.push(input);
+    }
+}
+
+const traces = files.map(f => parseInput(fs.readFileSync(f), f));
+const merged = {
+    source: traces.length === 1 ? traces[0].source : 'mixed',
+    threads: traces.flatMap(t => t.threads)
+};
+
+console.log(formatReport(merged, {color}));

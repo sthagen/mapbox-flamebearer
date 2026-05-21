@@ -1,2 +1,3 @@
-*.json.gz
 node_modules
+*.json.gz
+*.cpuprofile
