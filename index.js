@@ -76,29 +76,40 @@ export function formatFrame(f, shorten) {
     return `${name}  ${shorten ? shorten(f.url) : f.url}${loc}`;
 }
 
-export function buildShortener(urls) {
+export function buildShortener(urlCounts, threshold = 0.8) {
     const byOrigin = new Map();
-    for (const url of urls) {
+    for (const [url, count] of urlCounts) {
         const origin = parseOrigin(url);
         if (!origin) continue;
         const list = byOrigin.get(origin);
-        if (list) list.push(url);
-        else byOrigin.set(origin, [url]);
+        if (list) list.push({url, count});
+        else byOrigin.set(origin, [{url, count}]);
     }
 
     let dominant = null;
-    let dominantCount = 0;
+    let dominantWeight = 0;
     const prefixes = new Map();
 
     for (const [origin, list] of byOrigin) {
-        let prefix = list[0];
-        for (let i = 1; i < list.length && prefix.length > origin.length; i++) {
-            prefix = commonPrefix(prefix, list[i]);
+        const candidates = new Map();
+        let total = 0;
+        for (const {url, count} of list) {
+            total += count;
+            let i = url.indexOf('/', origin.length);
+            while (i !== -1) {
+                const prefix = url.slice(0, i + 1);
+                candidates.set(prefix, (candidates.get(prefix) || 0) + count);
+                i = url.indexOf('/', i + 1);
+            }
         }
-        prefix = prefix.slice(0, prefix.lastIndexOf('/') + 1);
-        prefixes.set(origin, prefix);
-        if (list.length > dominantCount) {
-            dominantCount = list.length;
+        const min = total * threshold;
+        let best = `${origin}/`;
+        for (const [prefix, w] of candidates) {
+            if (w >= min && prefix.length > best.length) best = prefix;
+        }
+        prefixes.set(origin, best);
+        if (total > dominantWeight) {
+            dominantWeight = total;
             dominant = origin;
         }
     }
@@ -111,24 +122,57 @@ export function buildShortener(urls) {
 
     function shorten(url) {
         const origin = parseOrigin(url);
-        const prefix = origin && prefixes.get(origin);
-        if (!prefix) return url;
-        const rest = url.slice(prefix.length);
-        return origin === dominant ? rest : `[${origin.replace(/^https?:\/\//, '')}] ${rest}`;
+        if (!origin) return url;
+        const prefix = prefixes.get(origin);
+        const path = prefix && url.startsWith(prefix) ? url.slice(prefix.length) : url.slice(origin.length);
+        return origin === dominant ? path : `[${origin.replace(/^https?:\/\//, '')}] ${path}`;
     }
 
     return {shorten, sources};
+}
+
+export function formatReport(trace, {top = 20} = {}) {
+    const urlCounts = new Map();
+    for (const t of trace.threads) {
+        for (let i = 0; i < Math.min(top, t.top.length); i++) {
+            const {url} = t.top[i].frame;
+            if (url) urlCounts.set(url, (urlCounts.get(url) || 0) + 1);
+        }
+    }
+    const {shorten, sources} = buildShortener(urlCounts);
+
+    const out = [];
+    if (sources.length) {
+        out.push('Sources:');
+        for (const {tag, prefix} of sources) {
+            out.push(`  ${tag ? `[${tag}]`.padEnd(20) : ' '.repeat(20)}  ${prefix}`);
+        }
+    }
+
+    for (const t of trace.threads) {
+        const busyMs = t.busy / 1000;
+        const idleMs = t.idle / 1000;
+        const totalUs = t.busy + t.idle;
+
+        out.push('');
+        out.push(`=== ${t.name} ===`);
+        out.push(`samples: ${t.samples}   busy: ${busyMs.toFixed(1)} ms   idle: ${idleMs.toFixed(1)} ms`);
+        out.push('');
+        out.push('Top CPU (self time):');
+
+        for (let i = 0; i < Math.min(top, t.top.length); i++) {
+            const {frame, time} = t.top[i];
+            const ms = (time / 1000).toFixed(1).padStart(7);
+            const pct = (totalUs > 0 ? (100 * time / totalUs).toFixed(1) : '0.0').padStart(5);
+            out.push(`${ms} ms  ${pct}%  ${formatFrame(frame, shorten)}`);
+        }
+    }
+
+    return out.join('\n');
 }
 
 function parseOrigin(url) {
     if (!url) return null;
     const m = url.match(/^[a-z]+:\/\/[^/]+/);
     return m ? m[0] : null;
-}
-
-function commonPrefix(a, b) {
-    const len = Math.min(a.length, b.length);
-    let i = 0;
-    while (i < len && a[i] === b[i]) i++;
-    return a.slice(0, i);
 }

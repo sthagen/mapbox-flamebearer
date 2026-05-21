@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
-import {parseTrace, formatFrame, buildShortener} from '../index.js';
+import {parseTrace, formatReport} from '../index.js';
 
 const file = process.argv[2];
 if (!file) {
@@ -8,34 +8,4 @@ if (!file) {
     process.exit(1);
 }
 
-const {threads} = parseTrace(fs.readFileSync(file));
-
-const TOP = 20;
-
-const urls = new Set();
-for (const t of threads) for (const {frame} of t.top) if (frame.url) urls.add(frame.url);
-const {shorten, sources} = buildShortener(urls);
-
-if (sources.length) {
-    console.log('Sources:');
-    for (const {tag, prefix} of sources) {
-        console.log(`  ${tag ? `[${tag}]`.padEnd(20) : ' '.repeat(20)}  ${prefix}`);
-    }
-}
-
-for (const t of threads) {
-    const busyMs = t.busy / 1000;
-    const idleMs = t.idle / 1000;
-    const total = busyMs + idleMs;
-
-    console.log(`\n=== ${t.name} ===`);
-    console.log(`samples: ${t.samples}   busy: ${busyMs.toFixed(1)} ms   idle: ${idleMs.toFixed(1)} ms`);
-
-    console.log('\nTop CPU (self time):');
-    for (let i = 0; i < Math.min(TOP, t.top.length); i++) {
-        const {frame, time} = t.top[i];
-        const ms = time / 1000;
-        const pct = total > 0 ? (100 * time / (total * 1000)).toFixed(1) : '0.0';
-        console.log(`${String(i + 1).padStart(3)}. ${ms.toFixed(1).padStart(7)} ms  ${pct.padStart(5)}%  ${formatFrame(frame, shorten)}`);
-    }
-}
+console.log(formatReport(parseTrace(fs.readFileSync(file))));
