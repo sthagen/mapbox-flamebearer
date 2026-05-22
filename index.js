@@ -16,21 +16,19 @@ export function parseInput(buf, filename) {
 }
 
 export function mergeTraces(traces) {
-    const embeddedMaps = new Map();
-    for (const t of traces) if (t.embeddedMaps) for (const [k, v] of t.embeddedMaps) embeddedMaps.set(k, v);
     return {
         source: traces.length === 1 ? traces[0].source : 'mixed',
         threads: traces.flatMap(t => t.threads),
-        embeddedMaps
+        embeddedMaps: new Map(traces.flatMap(t => [...t.embeddedMaps ?? []]))
     };
 }
 
 export function parseTrace(data) {
     const events = data.traceEvents || data;
     const embeddedMaps = new Map();
-    for (const sm of data.metadata?.sourceMaps || []) {
+    for (const sm of data.metadata?.sourceMaps ?? []) {
         if (sm.url && sm.sourceMap?.mappings) {
-            embeddedMaps.set(sm.url, new TraceMap(sm.sourceMap, sm.sourceMapUrl || sm.url));
+            embeddedMaps.set(sm.url, new TraceMap(sm.sourceMap, sm.sourceMapUrl ?? sm.url));
         }
     }
 
@@ -55,9 +53,9 @@ export function parseTrace(data) {
             const p = profiles.get(e.id);
             if (!p) continue;
             const {cpuProfile, timeDeltas} = e.args.data;
-            if (cpuProfile?.nodes) for (const n of cpuProfile.nodes) p.nodes.set(n.id, n);
-            if (cpuProfile?.samples) for (const s of cpuProfile.samples) p.samples.push(s);
-            if (timeDeltas) for (const d of timeDeltas) p.timeDeltas.push(d);
+            for (const n of cpuProfile?.nodes ?? []) p.nodes.set(n.id, n);
+            for (const s of cpuProfile?.samples ?? []) p.samples.push(s);
+            for (const d of timeDeltas ?? []) p.timeDeltas.push(d);
 
         } else if (e.ph === 'X' && e.dur > 0) {
             const key = `${e.pid}:${e.tid}`;
@@ -105,7 +103,7 @@ function buildThread({nodes, samples, timeDeltas, startTime}, name) {
     const sampleFrames = new Array(samples.length);
     let t = startTime;
     for (let i = 0; i < samples.length; i++) {
-        t += timeDeltas[i] || 0;
+        t += timeDeltas[i] ?? 0;
         sampleTimes[i] = t;
         const node = nodes.get(samples[i]);
         if (node) sampleFrames[i] = node.callFrame;
@@ -348,14 +346,8 @@ function table(rows, aligns, {gap = '  ', indent = ' '} = {}) {
 }
 
 export function buildShortener(urlCounts, threshold = 0.8) {
-    const byOrigin = new Map();
-    for (const [url, count] of urlCounts) {
-        const origin = parseOrigin(url);
-        if (!origin) continue;
-        const list = byOrigin.get(origin);
-        if (list) list.push({url, count});
-        else byOrigin.set(origin, [{url, count}]);
-    }
+    const byOrigin = Map.groupBy(urlCounts, ([url]) => parseOrigin(url));
+    byOrigin.delete(null);
 
     let dominant = null;
     let dominantWeight = 0;
@@ -364,7 +356,7 @@ export function buildShortener(urlCounts, threshold = 0.8) {
     for (const [origin, list] of byOrigin) {
         const candidates = new Map();
         let total = 0;
-        for (const {url, count} of list) {
+        for (const [url, count] of list) {
             total += count;
             let i = url.indexOf('/', origin.length);
             while (i !== -1) {
@@ -417,11 +409,14 @@ export function loadInputs(paths) {
     return files.map(f => parseInput(fs.readFileSync(f), f));
 }
 
-export function formatReport(input, {top = 20, color = false, sourceMaps = true, minDuration = 0, from, to, threads} = {}) {
+const BREAKDOWN_KEEP = new Set(['compile', 'loading']);
+const IDLE_THREAD_BUSY_US = 10_000;
+const IDLE_THREAD_BUSY_FRAC = 0.01;
+
+export function formatReport(input, {top = 10, color = false, sourceMaps = true, from, to, threads} = {}) {
     let trace = Array.isArray(input) ? mergeTraces(input) : input;
     if (from != null || to != null || threads?.length) trace = filterTrace(trace, {from, to, threads});
     if (sourceMaps) resolveSourceMaps(trace);
-    const minUs = minDuration * 1000;
     const paint = makePainter(color);
     const hotThreshold = 5;
     const fmtPct = (p) => {
@@ -456,13 +451,16 @@ export function formatReport(input, {top = 20, color = false, sourceMaps = true,
 
         out.push('');
         out.push(paint(`=== ${t.name} ===`, 'bold'));
-        out.push(`samples: ${t.samples}  busy: ${busyMs.toFixed(1)} ms  idle: ${idleMs.toFixed(1)} ms`);
 
-        if (t.breakdown?.length) {
-            const parts = t.breakdown
-                .filter(b => b.pct >= 1)
-                .map(b => `${b.category} ${b.pct.toFixed(1)}%`);
-            if (parts.length) out.push(parts.join('  '));
+        const breakdownParts = t.breakdown
+            ?.filter(b => BREAKDOWN_KEEP.has(b.category) && b.pct >= 1)
+            .map(b => `${b.category} ${b.pct.toFixed(1)}%`) || [];
+        const statsLine = `samples: ${t.samples}  busy: ${busyMs.toFixed(1)} ms  idle: ${idleMs.toFixed(1)} ms`;
+        out.push(breakdownParts.length ? `${statsLine}  (${breakdownParts.join('  ')})` : statsLine);
+
+        if (t.busy < IDLE_THREAD_BUSY_US || t.busy < IDLE_THREAD_BUSY_FRAC * totalUs) {
+            out.push(paint('(thread idle — nothing to report)', 'dim'));
+            continue;
         }
 
         out.push('');
@@ -470,17 +468,15 @@ export function formatReport(input, {top = 20, color = false, sourceMaps = true,
         const topRows = [];
         for (let i = 0; i < t.top.length && topRows.length < top; i++) {
             const {frame, time} = t.top[i];
-            if (time < minUs) break;
             const pct = totalUs > 0 ? 100 * time / totalUs : 0;
             topRows.push([fmtMs(time), fmtPct(pct), formatFrame(frame, shorten, paint)]);
         }
         for (const line of table(topRows, ['right', 'right', 'left'])) out.push(line);
 
-        const longTasks = t.longTasks?.filter(lt => lt.dur >= minUs);
-        if (longTasks?.length) {
+        if (t.longTasks?.length) {
             out.push('');
-            out.push(paint(`Long tasks (>50ms): ${longTasks.length}`, 'bold'));
-            const rows = longTasks.map(({ts, dur, dominant}) => [
+            out.push(paint(`Long tasks (>50ms): ${t.longTasks.length}`, 'bold'));
+            const rows = t.longTasks.map(({ts, dur, dominant}) => [
                 `t=${((ts - t.startTime) / 1000).toFixed(0)}ms`,
                 `${(dur / 1000).toFixed(0)} ms`,
                 dominant ? formatFrame(dominant, shorten, paint) : '—'
@@ -493,13 +489,12 @@ export function formatReport(input, {top = 20, color = false, sourceMaps = true,
 }
 
 function parseOrigin(url) {
-    const m = url?.match(/^(?:blob:)?[a-z][a-z-]*:\/\/[^/]*/);
-    return m ? m[0] : null;
+    return url?.match(/^(?:blob:)?[a-z][a-z-]*:\/\/[^/]*/)?.[0] ?? null;
 }
 
 function originTag(origin) {
-    const ext = origin.match(/^chrome-extension:\/\/([a-p]{6})/);
-    if (ext) return `ext:${ext[1]}`;
+    const ext = origin.match(/^chrome-extension:\/\/([a-p]{6})/)?.[1];
+    if (ext) return `ext:${ext}`;
     if (origin.startsWith('blob:')) return 'blob';
     return origin.replace(/^https?:\/\//, '');
 }

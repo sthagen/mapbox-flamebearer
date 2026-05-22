@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {parseArgs} from 'node:util';
 import {loadInputs, formatReport} from '../index.js';
 
 const HELP = `usage: flamebearer <input>... [options]
@@ -11,44 +12,46 @@ filtering:
   --to <ms>             end of time range
   --thread <name>       restrict to threads whose name contains <name>
                         (repeatable; matched case-insensitively)
-  --top <N>             show at most N rows in Top CPU (default 20)
-  --min-duration <ms>   hide Top CPU rows and long tasks shorter than <ms>
+  --top <N>             show at most N rows in Top CPU (default 10)
 
 output:
   --color / --no-color  force ANSI color (default: on if TTY and !$NO_COLOR)
   --no-sourcemap        skip sibling .map / embedded sourcemap resolution
   --help, -h            show this help`;
 
-const args = process.argv.slice(2);
-if (!args.length || args.includes('--help') || args.includes('-h')) {
+let values, positionals;
+try {
+    ({values, positionals} = parseArgs({
+        allowPositionals: true,
+        options: {
+            color: {type: 'boolean'},
+            'no-color': {type: 'boolean'},
+            'no-sourcemap': {type: 'boolean'},
+            from: {type: 'string'},
+            to: {type: 'string'},
+            thread: {type: 'string', multiple: true},
+            top: {type: 'string'},
+            help: {type: 'boolean', short: 'h'}
+        }
+    }));
+} catch (e) {
+    console.error(e.message);
+    process.exit(2);
+}
+
+if (values.help || !positionals.length) {
     console.log(HELP);
-    process.exit(args.length ? 0 : 1);
+    process.exit(positionals.length ? 0 : 1);
 }
 
-const inputs = [];
-const threads = [];
-const opts = {};
-let colorFlag = null;
+const opts = {
+    threads: values.thread ?? [],
+    sourceMaps: !values['no-sourcemap'],
+    color: values.color ?? (!values['no-color'] && process.stdout.isTTY && !process.env.NO_COLOR),
+    from: values.from != null ? +values.from : undefined,
+    to: values.to != null ? +values.to : undefined,
+    top: values.top != null ? +values.top : undefined
+};
 
-for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    const next = () => {
-        if (i + 1 >= args.length) { console.error(`missing value for ${a}`); process.exit(2); }
-        return args[++i];
-    };
-    if (a === '--color') colorFlag = true;
-    else if (a === '--no-color') colorFlag = false;
-    else if (a === '--no-sourcemap') opts.sourceMaps = false;
-    else if (a === '--from') opts.from = Number(next());
-    else if (a === '--to') opts.to = Number(next());
-    else if (a === '--thread') threads.push(next());
-    else if (a === '--top') opts.top = Number(next());
-    else if (a === '--min-duration') opts.minDuration = Number(next());
-    else if (a.startsWith('--')) { console.error(`unknown option: ${a}`); process.exit(2); } else inputs.push(a);
-}
-
-opts.threads = threads;
-opts.color = colorFlag ?? (process.stdout.isTTY && !process.env.NO_COLOR);
-
-console.log(formatReport(loadInputs(inputs), opts));
-console.log('\n(filters: --top N --thread NAME --from/--to MS --min-duration MS; --help for all)');
+console.log(formatReport(loadInputs(positionals), opts));
+console.log('\n(filters: --top N --thread NAME --from/--to MS; --help for all)');
