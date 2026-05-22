@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {TraceMap} from '@jridgewell/trace-mapping';
-import {parseInput, parseTrace, parseCpuProfile, buildShortener, formatReport, resolveSourceMaps} from '../index.js';
+import {parseInput, parseTrace, parseCpuProfile, buildShortener, formatReport, resolveSourceMaps, findStacks} from '../index.js';
 
 const tinyCpuProfile = {
     nodes: [
@@ -174,6 +174,114 @@ test('resolveSourceMaps picks up inline data-URL maps from source files', () => 
     assert.match(f.url, /index\.ts$/);
     assert.equal(f.functionName, 'myFunc');
     fs.rmSync(tmp, {recursive: true});
+});
+
+test('findStacks aggregates callers and callees of matching frames', () => {
+    // tree: root -> outer -> mid -> leafA (sampled)
+    //                    -> leafB (sampled)
+    //       root -> other -> mid -> leafA (sampled, second call site for mid)
+    const profile = {
+        nodes: [
+            {id: 1, callFrame: {functionName: '(root)', url: '', lineNumber: -1, columnNumber: -1}, children: [2, 6]},
+            {id: 2, callFrame: {functionName: 'outer', url: 'a.js', lineNumber: 0, columnNumber: 0}, children: [3]},
+            {id: 3, callFrame: {functionName: 'mid',   url: 'a.js', lineNumber: 1, columnNumber: 0}, children: [4, 5]},
+            {id: 4, callFrame: {functionName: 'leafA', url: 'a.js', lineNumber: 2, columnNumber: 0}},
+            {id: 5, callFrame: {functionName: 'leafB', url: 'a.js', lineNumber: 3, columnNumber: 0}},
+            {id: 6, callFrame: {functionName: 'other', url: 'a.js', lineNumber: 4, columnNumber: 0}, children: [7]},
+            {id: 7, callFrame: {functionName: 'mid',   url: 'a.js', lineNumber: 1, columnNumber: 0}, children: [8]},
+            {id: 8, callFrame: {functionName: 'leafA', url: 'a.js', lineNumber: 2, columnNumber: 0}}
+        ],
+        samples: [4, 5, 8, 3], // leafA, leafB, leafA (other path), mid self
+        timeDeltas: [1000, 2000, 4000, 500],
+        startTime: 0
+    };
+    const t = parseCpuProfile(profile, 'tt');
+    const groups = findStacks(t, 'mid');
+
+    // Both mid nodes (id 3 and id 7) share the same frame identity (same file/line/col),
+    // so they merge into one group with sites=2.
+    assert.equal(groups.length, 1);
+    const g = groups[0];
+    assert.equal(g.sites, 2);
+    assert.equal(g.self, 500);                       // only sample[3] hits a mid node directly
+    assert.equal(g.total, 1000 + 2000 + 4000 + 500); // all descendants + mid's own self
+
+    const callers = Object.fromEntries(g.callers.map(c => [c.frame.functionName, c.time]));
+    assert.equal(callers.outer, 1000 + 2000 + 500); // mid(id 3) total: leafA + leafB + self
+    assert.equal(callers.other, 4000);              // mid(id 7) total: leafA only
+
+    const callees = Object.fromEntries(g.callees.map(c => [c.frame.functionName, c.time]));
+    assert.equal(callees.leafA, 1000 + 4000);
+    assert.equal(callees.leafB, 2000);
+
+    // Hot path is a tree: aggregates descendants by frame identity across all matching call
+    // sites, branches into every child above the threshold. leafA (5000us across mid(3)+mid(7))
+    // and leafB (2000us under mid(3)) both clear the 5% cutoff of g.total (7500us).
+    assert.equal(g.hotPath.length, 2);
+    assert.equal(g.hotPath[0].frame.functionName, 'leafA');
+    assert.equal(g.hotPath[0].time, 5000);
+    assert.equal(g.hotPath[1].frame.functionName, 'leafB');
+    assert.equal(g.hotPath[1].time, 2000);
+    assert.equal(g.hotPath[0].children.length, 0);
+
+    // Exact match is case-insensitive; substring no longer matches.
+    assert.equal(findStacks(t, 'MID').length, 1);
+    assert.deepEqual(findStacks(t, 'mi'), []);
+    assert.deepEqual(findStacks(t, 'nonexistent'), []);
+});
+
+test('findStacks splits same-named functions in different files into separate groups', () => {
+    const profile = {
+        nodes: [
+            {id: 1, callFrame: {functionName: '(root)', url: '', lineNumber: -1, columnNumber: -1}, children: [2, 4]},
+            {id: 2, callFrame: {functionName: 'caller1', url: 'a.js', lineNumber: 0, columnNumber: 0}, children: [3]},
+            {id: 3, callFrame: {functionName: 'draw',    url: 'foo.js', lineNumber: 10, columnNumber: 0}},
+            {id: 4, callFrame: {functionName: 'caller2', url: 'b.js', lineNumber: 0, columnNumber: 0}, children: [5]},
+            {id: 5, callFrame: {functionName: 'draw',    url: 'bar.js', lineNumber: 20, columnNumber: 0}}
+        ],
+        samples: [3, 5],
+        timeDeltas: [1000, 4000],
+        startTime: 0
+    };
+    const t = parseCpuProfile(profile, 'tt');
+    const groups = findStacks(t, 'draw');
+    assert.equal(groups.length, 2);
+    // Sorted by total time desc.
+    assert.equal(groups[0].frame.url, 'bar.js');
+    assert.equal(groups[0].total, 4000);
+    assert.equal(groups[0].callers[0].frame.functionName, 'caller2');
+    assert.equal(groups[1].frame.url, 'foo.js');
+    assert.equal(groups[1].callers[0].frame.functionName, 'caller1');
+});
+
+test('findStacks handles Chrome ProfileChunk nodes (parent field, no children arrays)', () => {
+    // Same shape as the cpuprofile test above but using `parent` instead of `children`,
+    // matching what Chrome embeds in ProfileChunk events.
+    const events = [
+        {name: 'Profile', id: '0xp', pid: 1, tid: 2, args: {data: {startTime: 0}}},
+        {name: 'ProfileChunk', id: '0xp', pid: 1, tid: 2, args: {data: {
+            cpuProfile: {
+                nodes: [
+                    {id: 1, callFrame: {functionName: '(root)', url: '', lineNumber: -1, columnNumber: -1}},
+                    {id: 2, callFrame: {functionName: 'outer', url: 'a.js', lineNumber: 0, columnNumber: 0}, parent: 1},
+                    {id: 3, callFrame: {functionName: 'mid',   url: 'a.js', lineNumber: 1, columnNumber: 0}, parent: 2},
+                    {id: 4, callFrame: {functionName: 'leaf',  url: 'a.js', lineNumber: 2, columnNumber: 0}, parent: 3}
+                ],
+                samples: [4, 4]
+            },
+            timeDeltas: [1000, 2000]
+        }}}
+    ];
+    const trace = parseTrace({traceEvents: events});
+    const groups = findStacks(trace.threads[0], 'mid');
+    assert.equal(groups.length, 1);
+    const g = groups[0];
+    assert.equal(g.sites, 1);
+    assert.equal(g.total, 3000); // includes leaf's 3000us via children inverted from parent
+    assert.equal(g.callers[0].frame.functionName, 'outer');
+    assert.equal(g.callers[0].time, 3000);
+    assert.equal(g.callees[0].frame.functionName, 'leaf');
+    assert.equal(g.callees[0].time, 3000);
 });
 
 test('formatReport runs on both fixture types and includes key sections', () => {

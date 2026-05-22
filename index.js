@@ -101,14 +101,30 @@ const IDLE_SAMPLE_NAMES = new Set(['(idle)', '(program)']);
 function buildThread({nodes, samples, timeDeltas, startTime}, name) {
     const sampleTimes = new Array(samples.length);
     const sampleFrames = new Array(samples.length);
+    const nodeSelfTime = new Map();
     let t = startTime;
     for (let i = 0; i < samples.length; i++) {
-        t += timeDeltas[i] ?? 0;
+        const dt = timeDeltas[i] ?? 0;
+        t += dt;
         sampleTimes[i] = t;
-        const node = nodes.get(samples[i]);
+        const id = samples[i];
+        const node = nodes.get(id);
         if (node) sampleFrames[i] = node.callFrame;
+        nodeSelfTime.set(id, (nodeSelfTime.get(id) ?? 0) + dt);
+    }
+    const nodeParent = new Map();
+    const nodeChildren = new Map();
+    for (const n of nodes.values()) {
+        if (n.parent != null) nodeParent.set(n.id, n.parent);
+        else if (n.children) for (const c of n.children) nodeParent.set(c, n.id);
+    }
+    for (const [id, parent] of nodeParent) {
+        const list = nodeChildren.get(parent);
+        if (list) list.push(id);
+        else nodeChildren.set(parent, [id]);
     }
     return {name, sampleTimes, sampleFrames, startTime,
+        nodes, nodeParent, nodeChildren, nodeSelfTime,
         ...aggregate(sampleTimes, sampleFrames, startTime, -Infinity, Infinity)};
 }
 
@@ -267,9 +283,106 @@ export function resolveSourceMaps(trace, {load = loadSiblingMap} = {}) {
     };
 
     for (const t of trace.threads) {
-        for (const e of t.top) remap(e.frame);
-        if (t.longTasks) for (const lt of t.longTasks) remap(lt.dominant);
+        if (t.nodes) for (const n of t.nodes.values()) remap(n.callFrame);
+        else {
+            for (const e of t.top) remap(e.frame);
+            if (t.longTasks) for (const lt of t.longTasks) remap(lt.dominant);
+        }
     }
+}
+
+export function findStacks(thread, pattern) {
+    const {nodes, nodeParent, nodeChildren, nodeSelfTime} = thread;
+    if (!nodes) return [];
+    const needle = pattern.toLowerCase();
+
+    const totals = new Map();
+    const totalOf = (id) => {
+        const cached = totals.get(id);
+        if (cached !== undefined) return cached;
+        let t = nodeSelfTime.get(id) ?? 0;
+        for (const c of nodeChildren.get(id) ?? []) t += totalOf(c);
+        totals.set(id, t);
+        return t;
+    };
+
+    // Aggregate (frame, time) pairs into a map keyed by frame identity, optionally tracking
+    // the node ids contributing to each bucket (needed for hot-path tree traversal).
+    const addFrame = (map, frame, time, id) => {
+        const key = frameKey(frame);
+        const e = map.get(key);
+        if (e) {
+            e.time += time;
+            if (e.ids) e.ids.push(id);
+        } else {
+            map.set(key, id !== undefined ? {frame, time, ids: [id]} : {frame, time});
+        }
+    };
+
+    // Exact match on functionName (case-insensitive); use --grep for substring/regex search.
+    // Group by full frame identity so same name in different files = separate groups.
+    const groups = new Map();
+    for (const n of nodes.values()) {
+        if (n.callFrame?.functionName?.toLowerCase() !== needle) continue;
+        const key = frameKey(n.callFrame);
+        let g = groups.get(key);
+        if (!g) {
+            g = {frame: n.callFrame, self: 0, total: 0, sites: 0,
+                callers: new Map(), callees: new Map(), matchingIds: [], hotPath: []};
+            groups.set(key, g);
+        }
+        const nTotal = totalOf(n.id);
+        g.self += nodeSelfTime.get(n.id) ?? 0;
+        g.total += nTotal;
+        g.sites++;
+        g.matchingIds.push(n.id);
+
+        const parent = nodes.get(nodeParent.get(n.id));
+        if (parent?.callFrame) addFrame(g.callers, parent.callFrame, nTotal);
+        for (const c of nodeChildren.get(n.id) ?? []) {
+            const child = nodes.get(c);
+            if (child?.callFrame) addFrame(g.callees, child.callFrame, totalOf(c));
+        }
+    }
+
+    // Hot path: a tree of dominant descendants. At each level, aggregate children of the
+    // current node set by frame identity, keep those above HOT_PATH_MIN_PCT of the group's
+    // total, recurse into each. Capped by per-level branch count and a total node budget.
+    const HOT_PATH_MIN_PCT = 5, HOT_PATH_MAX_DEPTH = 6, HOT_PATH_MAX_BRANCH = 3, HOT_PATH_BUDGET = 8;
+    for (const g of groups.values()) {
+        const cutoff = g.total * HOT_PATH_MIN_PCT / 100;
+        const budget = {n: HOT_PATH_BUDGET};
+        const build = (frontier, depth) => {
+            if (depth >= HOT_PATH_MAX_DEPTH || budget.n <= 0) return [];
+            const byFrame = new Map();
+            for (const id of frontier) {
+                for (const c of nodeChildren.get(id) ?? []) {
+                    const child = nodes.get(c);
+                    if (child?.callFrame) addFrame(byFrame, child.callFrame, totalOf(c), c);
+                }
+            }
+            const branches = [...byFrame.values()]
+                .filter(e => e.time >= cutoff)
+                .sort((a, b) => b.time - a.time)
+                .slice(0, HOT_PATH_MAX_BRANCH);
+            const result = [];
+            for (const e of branches) {
+                if (budget.n <= 0) break;
+                budget.n--;
+                result.push({frame: e.frame, time: e.time, children: build(e.ids, depth + 1)});
+            }
+            return result;
+        };
+        g.hotPath = build(g.matchingIds, 0);
+    }
+
+    const sortDesc = m => [...m.values()].sort((a, b) => b.time - a.time);
+    for (const g of groups.values()) {
+        g.callers = sortDesc(g.callers);
+        g.callees = sortDesc(g.callees);
+        delete g.matchingIds;
+    }
+    return [...groups.values()].sort((a, b) => b.total - a.total);
 }
 
 function loadSiblingMap(url) {
@@ -312,18 +425,19 @@ export function frameKind(f) {
 
 const KIND_COLORS = {user: 'green', deps: 'cyan', node: 'blue', ext: 'magenta', native: 'yellow', gc: 'yellow', system: 'dim'};
 
-export function formatFrame(f, shorten, paint) {
+export function formatFrame(f, shorten, paint, bold = false) {
     const name = f.functionName || '(anonymous)';
     const color = KIND_COLORS[frameKind(f)];
-    const coloredName = paint(name, color);
+    const style = !bold ? color : color === 'dim' ? 'bold' : `bold+${color}`;
+    const coloredName = paint(name, style);
     if (!f.url) return coloredName;
     const loc = f.lineNumber >= 0 ? `:${f.lineNumber + 1}` : '';
     return `${coloredName}  ${paint(`${shorten ? shorten(f.url) : f.url}${loc}`, 'dim')}`;
 }
 
-const ANSI = {bold: '1', dim: '2', red: '31', green: '32', yellow: '33', blue: '34', magenta: '35', cyan: '36', boldRed: '1;31'};
+const ANSI = {bold: '1', dim: '2', red: '31', green: '32', yellow: '33', blue: '34', magenta: '35', cyan: '36'};
 function makePainter(on) {
-    return on ? (s, style) => `\x1b[${ANSI[style]}m${s}\x1b[0m` : s => s;
+    return on ? (s, style) => `\x1b[${style.split('+').map(k => ANSI[k]).join(';')}m${s}\x1b[0m` : s => s;
 }
 
 // eslint-disable-next-line no-control-regex
@@ -413,7 +527,7 @@ const BREAKDOWN_KEEP = new Set(['compile', 'loading']);
 const IDLE_THREAD_BUSY_US = 10_000;
 const IDLE_THREAD_BUSY_FRAC = 0.01;
 
-export function formatReport(input, {top = 10, color = false, sourceMaps = true, from, to, threads} = {}) {
+export function formatReport(input, {top = 10, color = false, sourceMaps = true, from, to, threads, stacks} = {}) {
     let trace = Array.isArray(input) ? mergeTraces(input) : input;
     if (from != null || to != null || threads?.length) trace = filterTrace(trace, {from, to, threads});
     if (sourceMaps) resolveSourceMaps(trace);
@@ -421,18 +535,24 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
     const hotThreshold = 5;
     const fmtPct = (p) => {
         const s = `${p.toFixed(1)}%`;
-        return p >= hotThreshold ? paint(s, 'boldRed') : s;
+        return p >= hotThreshold ? paint(s, 'bold+red') : s;
     };
     const fmtMs = us => `${(us / 1000).toFixed(1)} ms`;
 
+    const stackResults = stacks ? trace.threads.map(t => findStacks(t, stacks)) : null;
     const urlCounts = new Map();
-    for (const t of trace.threads) {
-        for (let i = 0; i < Math.min(top, t.top.length); i++) {
-            const {url} = t.top[i].frame;
-            if (url) urlCounts.set(url, (urlCounts.get(url) || 0) + 1);
-        }
-        if (t.longTasks) for (const lt of t.longTasks) {
-            if (lt.dominant?.url) urlCounts.set(lt.dominant.url, (urlCounts.get(lt.dominant.url) || 0) + 1);
+    const countUrl = (url) => { if (url) urlCounts.set(url, (urlCounts.get(url) || 0) + 1); };
+    for (let i = 0; i < trace.threads.length; i++) {
+        const t = trace.threads[i];
+        if (stacks) {
+            for (const g of stackResults[i]) {
+                countUrl(g.frame.url);
+                for (const e of g.callers.slice(0, top)) countUrl(e.frame.url);
+                for (const e of g.callees.slice(0, top)) countUrl(e.frame.url);
+            }
+        } else {
+            for (let j = 0; j < Math.min(top, t.top.length); j++) countUrl(t.top[j].frame.url);
+            if (t.longTasks) for (const lt of t.longTasks) countUrl(lt.dominant?.url);
         }
     }
     const {shorten, sources} = buildShortener(urlCounts);
@@ -444,10 +564,54 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
         for (const line of table(rows, ['left', 'left'])) out.push(line);
     }
 
-    for (const t of trace.threads) {
+    for (let ti = 0; ti < trace.threads.length; ti++) {
+        const t = trace.threads[ti];
+        const totalUs = t.busy + t.idle;
+
+        if (stacks) {
+            const groups = stackResults[ti];
+            if (!groups.length) continue;
+            out.push('');
+            out.push(paint(`=== ${t.name} ===`, 'bold'));
+            for (const g of groups) {
+                const totalPct = totalUs > 0 ? 100 * g.total / totalUs : 0;
+                const selfPct = totalUs > 0 ? 100 * g.self / totalUs : 0;
+                out.push('');
+                out.push(`${paint('Stacks:', 'bold')} ${formatFrame(g.frame, shorten, paint, true)}`);
+                out.push(paint(`  ${g.sites} site${g.sites > 1 ? 's' : ''}; total ${fmtMs(g.total)} ${totalPct.toFixed(1)}%, self ${fmtMs(g.self)} ${selfPct.toFixed(1)}%`, 'dim'));
+                if (g.hotPath?.length) {
+                    out.push(`${paint('  Hot path:', 'bold')} ${paint('(% of this function\'s total time)', 'dim')}`);
+                    const renderHot = (entries, depth) => {
+                        for (const {frame, time, children} of entries) {
+                            const pct = g.total > 0 ? 100 * time / g.total : 0;
+                            const pctStr = `${pct.toFixed(1)}%`.padStart(6);
+                            out.push(`    ${pctStr}  ${'  '.repeat(depth)}${formatFrame(frame, shorten, paint)}`);
+                            renderHot(children, depth + 1);
+                        }
+                    };
+                    renderHot(g.hotPath, 0);
+                }
+                const section = (label, entries) => {
+                    if (!entries.length) return;
+                    const shown = entries.slice(0, top);
+                    const more = entries.length - shown.length;
+                    out.push(paint(`  ${label}:`, 'bold'));
+                    const rows = shown.map(({frame, time}) => [
+                        fmtMs(time),
+                        fmtPct(totalUs > 0 ? 100 * time / totalUs : 0),
+                        formatFrame(frame, shorten, paint)
+                    ]);
+                    for (const line of table(rows, ['right', 'right', 'left'], {indent: '   '})) out.push(line);
+                    if (more > 0) out.push(paint(`   … ${more} more`, 'dim'));
+                };
+                section('Callers', g.callers);
+                section('Callees', g.callees);
+            }
+            continue;
+        }
+
         const busyMs = t.busy / 1000;
         const idleMs = t.idle / 1000;
-        const totalUs = t.busy + t.idle;
 
         out.push('');
         out.push(paint(`=== ${t.name} ===`, 'bold'));
@@ -483,6 +647,7 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
             ]);
             for (const line of table(rows, ['right', 'right', 'left'])) out.push(line);
         }
+
     }
 
     return out.join('\n');

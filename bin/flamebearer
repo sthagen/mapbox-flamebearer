@@ -13,6 +13,9 @@ filtering:
   --thread <name>       restrict to threads whose name contains <name>
                         (repeatable; matched case-insensitively)
   --top <N>             show at most N rows in Top CPU (default 10)
+  --stacks <name>       drill into a function by exact name (case-insensitive):
+                        callers, callees, and dominant descendant path.
+                        Same name in multiple files = one block per file.
 
 output:
   --color / --no-color  force ANSI color (default: on if TTY and !$NO_COLOR)
@@ -31,6 +34,7 @@ try {
             to: {type: 'string'},
             thread: {type: 'string', multiple: true},
             top: {type: 'string'},
+            stacks: {type: 'string'},
             help: {type: 'boolean', short: 'h'}
         }
     }));
@@ -50,7 +54,8 @@ const opts = {
     color: values.color ?? (!values['no-color'] && process.stdout.isTTY && !process.env.NO_COLOR),
     from: values.from != null ? +values.from : undefined,
     to: values.to != null ? +values.to : undefined,
-    top: values.top != null ? +values.top : undefined
+    top: values.top != null ? +values.top : undefined,
+    stacks: values.stacks
 };
 
 console.log(formatReport(loadInputs(positionals), opts));
