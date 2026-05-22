@@ -291,33 +291,95 @@ export function resolveSourceMaps(trace, {load = loadSiblingMap} = {}) {
     }
 }
 
+function totalsCache(thread) {
+    const {nodeChildren, nodeSelfTime} = thread;
+    const cache = new Map();
+    const totalOf = (id) => {
+        const c = cache.get(id);
+        if (c !== undefined) return c;
+        let t = nodeSelfTime.get(id) ?? 0;
+        for (const k of nodeChildren.get(id) ?? []) t += totalOf(k);
+        cache.set(id, t);
+        return t;
+    };
+    return totalOf;
+}
+
+// Aggregate (frame, time) pairs into a map keyed by frame identity, optionally tracking
+// the contributing node ids (needed when callers want to recurse from this frontier).
+function addFrame(map, frame, time, id) {
+    const key = frameKey(frame);
+    const e = map.get(key);
+    if (e) {
+        e.time += time;
+        if (e.ids) e.ids.push(id);
+    } else {
+        map.set(key, id !== undefined ? {frame, time, ids: [id]} : {frame, time});
+    }
+}
+
+const SYSTEM_NAMES = new Set(['(idle)', '(program)', '(root)', '(no symbol)', '(garbage collector)']);
+
+// Hot-tree builder: at each level, aggregate children of the frontier by frame identity,
+// keep branches above `cutoffUs`, recurse. Capped by depth, per-level branch count, and
+// a total node budget. Used by both --stacks hot-path and the default heaviest-stacks tree.
+function buildHotTree(thread, frontier, cutoffUs, totalOf, {maxDepth = 6, maxBranch = 3, budget = 8} = {}) {
+    const {nodes, nodeChildren, nodeSelfTime} = thread;
+    const state = {budget};
+    const build = (front, depth) => {
+        if (depth >= maxDepth || state.budget <= 0) return [];
+        const byFrame = new Map();
+        for (const id of front) {
+            for (const c of nodeChildren.get(id) ?? []) {
+                const child = nodes.get(c);
+                if (!child?.callFrame || SYSTEM_NAMES.has(child.callFrame.functionName)) continue;
+                addFrame(byFrame, child.callFrame, totalOf(c), c);
+            }
+        }
+        const branches = [...byFrame.values()]
+            .filter(e => e.time >= cutoffUs)
+            .sort((a, b) => b.time - a.time)
+            .slice(0, maxBranch);
+        const result = [];
+        for (const e of branches) {
+            if (state.budget <= 0) break;
+            state.budget--;
+            const self = e.ids.reduce((s, id) => s + (nodeSelfTime.get(id) ?? 0), 0);
+            result.push({frame: e.frame, time: e.time, self, children: build(e.ids, depth + 1)});
+        }
+        return result;
+    };
+    return build(frontier, 0);
+}
+
+// System parents: nodes whose own frame is system but which have non-system children —
+// the V8 (root)/(program) wrappers that sit above real entry points. Used as the frontier
+// for topPaths so the tree starts at user-visible code, not at the synthetic wrappers.
+function systemParents(thread) {
+    const {nodes, nodeParent} = thread;
+    const set = new Set();
+    for (const n of nodes.values()) {
+        const name = n.callFrame?.functionName;
+        if (!name || SYSTEM_NAMES.has(name)) continue;
+        const pid = nodeParent.get(n.id);
+        if (pid == null) continue;
+        const parentName = nodes.get(pid)?.callFrame?.functionName;
+        if (parentName && SYSTEM_NAMES.has(parentName)) set.add(pid);
+    }
+    return [...set];
+}
+
+export function topPaths(thread, {cutoffPct = 5, maxDepth = 10, maxBranch = 3, budget = 15} = {}) {
+    if (!thread.nodes || !thread.busy) return [];
+    const cutoff = thread.busy * cutoffPct / 100;
+    return buildHotTree(thread, systemParents(thread), cutoff, totalsCache(thread), {maxDepth, maxBranch, budget});
+}
+
 export function findStacks(thread, pattern) {
     const {nodes, nodeParent, nodeChildren, nodeSelfTime} = thread;
     if (!nodes) return [];
     const needle = pattern.toLowerCase();
-
-    const totals = new Map();
-    const totalOf = (id) => {
-        const cached = totals.get(id);
-        if (cached !== undefined) return cached;
-        let t = nodeSelfTime.get(id) ?? 0;
-        for (const c of nodeChildren.get(id) ?? []) t += totalOf(c);
-        totals.set(id, t);
-        return t;
-    };
-
-    // Aggregate (frame, time) pairs into a map keyed by frame identity, optionally tracking
-    // the node ids contributing to each bucket (needed for hot-path tree traversal).
-    const addFrame = (map, frame, time, id) => {
-        const key = frameKey(frame);
-        const e = map.get(key);
-        if (e) {
-            e.time += time;
-            if (e.ids) e.ids.push(id);
-        } else {
-            map.set(key, id !== undefined ? {frame, time, ids: [id]} : {frame, time});
-        }
-    };
+    const totalOf = totalsCache(thread);
 
     // Exact match on functionName (case-insensitive); use --grep for substring/regex search.
     // Group by full frame identity so same name in different files = separate groups.
@@ -345,35 +407,8 @@ export function findStacks(thread, pattern) {
         }
     }
 
-    // Hot path: a tree of dominant descendants. At each level, aggregate children of the
-    // current node set by frame identity, keep those above HOT_PATH_MIN_PCT of the group's
-    // total, recurse into each. Capped by per-level branch count and a total node budget.
-    const HOT_PATH_MIN_PCT = 5, HOT_PATH_MAX_DEPTH = 6, HOT_PATH_MAX_BRANCH = 3, HOT_PATH_BUDGET = 8;
     for (const g of groups.values()) {
-        const cutoff = g.total * HOT_PATH_MIN_PCT / 100;
-        const budget = {n: HOT_PATH_BUDGET};
-        const build = (frontier, depth) => {
-            if (depth >= HOT_PATH_MAX_DEPTH || budget.n <= 0) return [];
-            const byFrame = new Map();
-            for (const id of frontier) {
-                for (const c of nodeChildren.get(id) ?? []) {
-                    const child = nodes.get(c);
-                    if (child?.callFrame) addFrame(byFrame, child.callFrame, totalOf(c), c);
-                }
-            }
-            const branches = [...byFrame.values()]
-                .filter(e => e.time >= cutoff)
-                .sort((a, b) => b.time - a.time)
-                .slice(0, HOT_PATH_MAX_BRANCH);
-            const result = [];
-            for (const e of branches) {
-                if (budget.n <= 0) break;
-                budget.n--;
-                result.push({frame: e.frame, time: e.time, children: build(e.ids, depth + 1)});
-            }
-            return result;
-        };
-        g.hotPath = build(g.matchingIds, 0);
+        g.hotPath = buildHotTree(thread, g.matchingIds, g.total * 0.05, totalOf);
     }
 
     const sortDesc = m => [...m.values()].sort((a, b) => b.time - a.time);
@@ -523,6 +558,28 @@ export function loadInputs(paths) {
     return files.map(f => parseInput(fs.readFileSync(f), f));
 }
 
+// Render a hot-tree (output of buildHotTree) with two compactions:
+//   - collapse `parent → child` chains when one child dominates (≥80% of parent's time);
+//   - tag leaves whose own self time dominates their subtree (≥50%) — "stop drilling here".
+// Render a hot tree as breadcrumbs: function names only (the agent can `--stacks <name>` for
+// file/line), with `parent → child` chain collapse when one child dominates (≥80% of parent).
+function renderHotTree(out, entries, denomUs, paint, indent, depth = 0) {
+    for (const node of entries) {
+        const chain = [node];
+        let cur = node;
+        while (chain.length < 3 && cur.children.length === 1 && cur.children[0].time >= 0.8 * cur.time) {
+            cur = cur.children[0];
+            chain.push(cur);
+        }
+        const pct = denomUs > 0 ? 100 * node.time / denomUs : 0;
+        const pctStr = `${pct.toFixed(1)}%`.padStart(6);
+        const names = chain.map(c => paint(c.frame.functionName || '(anonymous)', KIND_COLORS[frameKind(c.frame)]))
+            .join(paint(' → ', 'dim'));
+        out.push(`${indent}${pctStr}  ${'  '.repeat(depth)}${names}`);
+        renderHotTree(out, cur.children, denomUs, paint, indent, depth + 1);
+    }
+}
+
 const BREAKDOWN_KEEP = new Set(['compile', 'loading']);
 const IDLE_THREAD_BUSY_US = 10_000;
 const IDLE_THREAD_BUSY_FRAC = 0.01;
@@ -540,6 +597,7 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
     const fmtMs = us => `${(us / 1000).toFixed(1)} ms`;
 
     const stackResults = stacks ? trace.threads.map(t => findStacks(t, stacks)) : null;
+    const heaviestResults = stacks ? null : trace.threads.map(t => topPaths(t));
     const urlCounts = new Map();
     const countUrl = (url) => { if (url) urlCounts.set(url, (urlCounts.get(url) || 0) + 1); };
     for (let i = 0; i < trace.threads.length; i++) {
@@ -581,15 +639,7 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
                 out.push(paint(`  ${g.sites} site${g.sites > 1 ? 's' : ''}; total ${fmtMs(g.total)} ${totalPct.toFixed(1)}%, self ${fmtMs(g.self)} ${selfPct.toFixed(1)}%`, 'dim'));
                 if (g.hotPath?.length) {
                     out.push(`${paint('  Hot path:', 'bold')} ${paint('(% of this function\'s total time)', 'dim')}`);
-                    const renderHot = (entries, depth) => {
-                        for (const {frame, time, children} of entries) {
-                            const pct = g.total > 0 ? 100 * time / g.total : 0;
-                            const pctStr = `${pct.toFixed(1)}%`.padStart(6);
-                            out.push(`    ${pctStr}  ${'  '.repeat(depth)}${formatFrame(frame, shorten, paint)}`);
-                            renderHot(children, depth + 1);
-                        }
-                    };
-                    renderHot(g.hotPath, 0);
+                    renderHotTree(out, g.hotPath, g.total, paint, '    ');
                 }
                 const section = (label, entries) => {
                     if (!entries.length) return;
@@ -625,6 +675,13 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
         if (t.busy < IDLE_THREAD_BUSY_US || t.busy < IDLE_THREAD_BUSY_FRAC * totalUs) {
             out.push(paint('(thread idle — nothing to report)', 'dim'));
             continue;
+        }
+
+        const heaviest = heaviestResults[ti];
+        if (heaviest?.length) {
+            out.push('');
+            out.push(`${paint('Heaviest stacks:', 'bold')} ${paint('(% of thread busy time)', 'dim')}`);
+            renderHotTree(out, heaviest, t.busy, paint, ' ');
         }
 
         out.push('');

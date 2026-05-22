@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {TraceMap} from '@jridgewell/trace-mapping';
-import {parseInput, parseTrace, parseCpuProfile, buildShortener, formatReport, resolveSourceMaps, findStacks} from '../index.js';
+import {parseInput, parseTrace, parseCpuProfile, buildShortener, formatReport, resolveSourceMaps, findStacks, topPaths} from '../index.js';
 
 const tinyCpuProfile = {
     nodes: [
@@ -228,6 +228,32 @@ test('findStacks aggregates callers and callees of matching frames', () => {
     assert.equal(findStacks(t, 'MID').length, 1);
     assert.deepEqual(findStacks(t, 'mi'), []);
     assert.deepEqual(findStacks(t, 'nonexistent'), []);
+});
+
+test('topPaths builds a heaviest-stacks tree rooted at real (non-system) entries', () => {
+    // root -> render -> renderLayer -> drawLine (dominant)
+    //                                -> drawSymbols
+    const profile = {
+        nodes: [
+            {id: 1, callFrame: {functionName: '(root)', url: '', lineNumber: -1, columnNumber: -1}, children: [2]},
+            {id: 2, callFrame: {functionName: 'render', url: 'p.js', lineNumber: 0, columnNumber: 0}, children: [3]},
+            {id: 3, callFrame: {functionName: 'renderLayer', url: 'p.js', lineNumber: 1, columnNumber: 0}, children: [4, 5]},
+            {id: 4, callFrame: {functionName: 'drawLine', url: 'p.js', lineNumber: 2, columnNumber: 0}},
+            {id: 5, callFrame: {functionName: 'drawSymbols', url: 'p.js', lineNumber: 3, columnNumber: 0}}
+        ],
+        samples: [4, 4, 4, 4, 5],
+        timeDeltas: [1000, 1000, 1000, 1000, 1000],
+        startTime: 0
+    };
+    const t = parseCpuProfile(profile, 'tt');
+    const tree = topPaths(t);
+    // Real root is `render` (parent is system (root)). renderLayer dominates render — collapses
+    // in rendering. Underneath, drawLine and drawSymbols both clear the cutoff.
+    assert.equal(tree.length, 1);
+    assert.equal(tree[0].frame.functionName, 'render');
+    assert.equal(tree[0].children[0].frame.functionName, 'renderLayer');
+    const grandkids = tree[0].children[0].children.map(c => c.frame.functionName).sort();
+    assert.deepEqual(grandkids, ['drawLine', 'drawSymbols']);
 });
 
 test('findStacks splits same-named functions in different files into separate groups', () => {
