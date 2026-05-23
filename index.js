@@ -407,17 +407,15 @@ export function findStacks(thread, pattern) {
         }
     }
 
+    const noiseUs = thread.busy * 0.01;
+    const sortDesc = m => [...m.values()].filter(e => e.time >= noiseUs).sort((a, b) => b.time - a.time);
     for (const g of groups.values()) {
         g.hotPath = buildHotTree(thread, g.matchingIds, g.total * 0.05, totalOf);
-    }
-
-    const sortDesc = m => [...m.values()].sort((a, b) => b.time - a.time);
-    for (const g of groups.values()) {
         g.callers = sortDesc(g.callers);
         g.callees = sortDesc(g.callees);
         delete g.matchingIds;
     }
-    return [...groups.values()].sort((a, b) => b.total - a.total);
+    return [...groups.values()].filter(g => g.total >= noiseUs).sort((a, b) => b.total - a.total);
 }
 
 function loadSiblingMap(url) {
@@ -558,9 +556,6 @@ export function loadInputs(paths) {
     return files.map(f => parseInput(fs.readFileSync(f), f));
 }
 
-// Render a hot-tree (output of buildHotTree) with two compactions:
-//   - collapse `parent → child` chains when one child dominates (≥80% of parent's time);
-//   - tag leaves whose own self time dominates their subtree (≥50%) — "stop drilling here".
 // Render a hot tree as breadcrumbs: function names only (the agent can `--stacks <name>` for
 // file/line), with `parent → child` chain collapse when one child dominates (≥80% of parent).
 function renderHotTree(out, entries, denomUs, paint, indent, depth = 0) {
@@ -584,8 +579,27 @@ const BREAKDOWN_KEEP = new Set(['compile', 'loading']);
 const IDLE_THREAD_BUSY_US = 10_000;
 const IDLE_THREAD_BUSY_FRAC = 0.01;
 
-export function formatReport(input, {top = 10, color = false, sourceMaps = true, from, to, threads, stacks} = {}) {
+// Append `#1`, `#2`, ... to threads whose name collides — Chrome gives every worker the
+// same `thread_name` ("DedicatedWorker thread"), so without this `--thread` can't target one
+// specifically and the report headers are indistinguishable.
+function disambiguateThreadNames(threads) {
+    const counts = new Map();
+    for (const t of threads) counts.set(t.name, (counts.get(t.name) || 0) + 1);
+    const seen = new Map();
+    for (const t of threads) {
+        if (counts.get(t.name) > 1) {
+            const n = (seen.get(t.name) || 0) + 1;
+            seen.set(t.name, n);
+            t.name = `${t.name} #${n}`;
+        }
+    }
+}
+
+const TOP_CPU_FLOOR_PCT = 0.5;
+
+export function formatReport(input, {top = 20, color = false, sourceMaps = true, from, to, threads, stacks} = {}) {
     let trace = Array.isArray(input) ? mergeTraces(input) : input;
+    disambiguateThreadNames(trace.threads);
     if (from != null || to != null || threads?.length) trace = filterTrace(trace, {from, to, threads});
     if (sourceMaps) resolveSourceMaps(trace);
     const paint = makePainter(color);
@@ -618,8 +632,11 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
     const out = [];
     if (sources.length) {
         out.push(paint('Sources:', 'bold'));
-        const rows = sources.map(({tag, prefix}) => [tag ? `[${tag}]` : '', paint(prefix, 'dim')]);
-        for (const line of table(rows, ['left', 'left'])) out.push(line);
+        const hasTags = sources.some(s => s.tag);
+        const rows = hasTags ?
+            sources.map(({tag, prefix}) => [tag ? `[${tag}]` : '', paint(prefix, 'dim')]) :
+            sources.map(({prefix}) => [paint(prefix, 'dim')]);
+        for (const line of table(rows, hasTags ? ['left', 'left'] : ['left'])) out.push(line);
     }
 
     for (let ti = 0; ti < trace.threads.length; ti++) {
@@ -638,7 +655,7 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
                 out.push(`${paint('Stacks:', 'bold')} ${formatFrame(g.frame, shorten, paint, true)}`);
                 out.push(paint(`  ${g.sites} site${g.sites > 1 ? 's' : ''}; total ${fmtMs(g.total)} ${totalPct.toFixed(1)}%, self ${fmtMs(g.self)} ${selfPct.toFixed(1)}%`, 'dim'));
                 if (g.hotPath?.length) {
-                    out.push(`${paint('  Hot path:', 'bold')} ${paint('(% of this function\'s total time)', 'dim')}`);
+                    out.push(`${paint('  Hot paths:', 'bold')} ${paint('(% of fn total)', 'dim')}`);
                     renderHotTree(out, g.hotPath, g.total, paint, '    ');
                 }
                 const section = (label, entries) => {
@@ -669,7 +686,8 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
         const breakdownParts = t.breakdown
             ?.filter(b => BREAKDOWN_KEEP.has(b.category) && b.pct >= 1)
             .map(b => `${b.category} ${b.pct.toFixed(1)}%`) || [];
-        const statsLine = `samples: ${t.samples}  busy: ${busyMs.toFixed(1)} ms  idle: ${idleMs.toFixed(1)} ms`;
+        const busyPct = totalUs > 0 ? 100 * t.busy / totalUs : 0;
+        const statsLine = `samples: ${t.samples}  busy: ${busyMs.toFixed(1)} ms (${busyPct.toFixed(1)}%)  idle: ${idleMs.toFixed(1)} ms`;
         out.push(breakdownParts.length ? `${statsLine}  (${breakdownParts.join('  ')})` : statsLine);
 
         if (t.busy < IDLE_THREAD_BUSY_US || t.busy < IDLE_THREAD_BUSY_FRAC * totalUs) {
@@ -680,7 +698,7 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
         const heaviest = heaviestResults[ti];
         if (heaviest?.length) {
             out.push('');
-            out.push(`${paint('Heaviest stacks:', 'bold')} ${paint('(% of thread busy time)', 'dim')}`);
+            out.push(`${paint('Heaviest stacks:', 'bold')} ${paint('(% of thread busy)', 'dim')}`);
             renderHotTree(out, heaviest, t.busy, paint, ' ');
         }
 
@@ -690,15 +708,16 @@ export function formatReport(input, {top = 10, color = false, sourceMaps = true,
         for (let i = 0; i < t.top.length && topRows.length < top; i++) {
             const {frame, time} = t.top[i];
             const pct = totalUs > 0 ? 100 * time / totalUs : 0;
+            if (pct < TOP_CPU_FLOOR_PCT) break;
             topRows.push([fmtMs(time), fmtPct(pct), formatFrame(frame, shorten, paint)]);
         }
         for (const line of table(topRows, ['right', 'right', 'left'])) out.push(line);
 
         if (t.longTasks?.length) {
             out.push('');
-            out.push(paint(`Long tasks (>50ms): ${t.longTasks.length}`, 'bold'));
+            out.push(paint('Long tasks:', 'bold'));
             const rows = t.longTasks.map(({ts, dur, dominant}) => [
-                `t=${((ts - t.startTime) / 1000).toFixed(0)}ms`,
+                `t=${Math.max(0, (ts - t.startTime) / 1000).toFixed(0)}ms`,
                 `${(dur / 1000).toFixed(0)} ms`,
                 dominant ? formatFrame(dominant, shorten, paint) : '—'
             ]);

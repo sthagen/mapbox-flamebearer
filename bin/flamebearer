@@ -12,10 +12,11 @@ filtering:
   --to <ms>             end of time range
   --thread <name>       restrict to threads whose name contains <name>
                         (repeatable; matched case-insensitively)
-  --top <N>             show at most N rows in Top CPU (default 10).
-                        Note: the heaviest-stacks tree (default output) gives
-                        a top-down view of where time goes; Top CPU is the
-                        complementary bottom-up self-time leaderboard.
+  --top <N>             cap Top CPU rows (default 20). Rows below 0.5% of
+                        thread busy time are always dropped, so the actual
+                        count is min(N, rows ≥ 0.5%). The heaviest-stacks
+                        tree (default output) is the top-down complement to
+                        Top CPU's bottom-up self-time leaderboard.
   --stacks <name>       drill into a function by exact name (case-insensitive):
                         callers, callees, and dominant descendant path.
                         Same name in multiple files = one block per file.
