@@ -310,6 +310,40 @@ test('findStacks handles Chrome ProfileChunk nodes (parent field, no children ar
     assert.equal(g.callees[0].time, 3000);
 });
 
+test('findStacks for (garbage collector) attributes via temporally preceding JS sample', () => {
+    // V8 puts every GC sample under a single (garbage collector) node parented to (root),
+    // so the call tree gives no caller info. The sandwich-style attribution reconstructs
+    // callers from the previous non-GC sample: foo runs, then GC -> foo is attributed.
+    const profile = {
+        nodes: [
+            {id: 1, callFrame: {functionName: '(root)', url: '', lineNumber: -1, columnNumber: -1}},
+            {id: 2, callFrame: {functionName: '(garbage collector)', url: '', lineNumber: -1, columnNumber: -1}},
+            {id: 3, callFrame: {functionName: 'foo', url: 'a.js', lineNumber: 0, columnNumber: 0}},
+            {id: 4, callFrame: {functionName: 'bar', url: 'b.js', lineNumber: 0, columnNumber: 0}}
+        ],
+        // gc (no prior JS — ignored), foo, foo, gc, gc, bar, gc
+        samples: [2, 3, 3, 2, 2, 4, 2],
+        timeDeltas: [500, 100, 100, 1000, 1000, 100, 1000],
+        startTime: 0
+    };
+    const t = parseCpuProfile(profile, 'tt');
+    const groups = findStacks(t, '(garbage collector)');
+    assert.equal(groups.length, 1);
+    const g = groups[0];
+    assert.equal(g.frame.functionName, '(garbage collector)');
+    assert.equal(g.total, 500 + 1000 + 1000 + 1000); // all four GC samples
+    assert.deepEqual(g.callees, []);
+    assert.deepEqual(g.hotPath, []);
+
+    const callers = Object.fromEntries(g.callers.map(c => [c.frame.functionName, c.time]));
+    assert.deepEqual(callers, {foo: 2000, bar: 1000});
+    // Sorted desc by time.
+    assert.equal(g.callers[0].frame.functionName, 'foo');
+    // The leading GC sample (no preceding JS) is not attributed to anyone — its 500us only
+    // appears in g.total, not in any caller.
+    assert.equal(g.callers.reduce((s, c) => s + c.time, 0), 3000);
+});
+
 test('formatReport runs on both fixture types and includes key sections', () => {
     const cpuBuf = fs.readFileSync('test/fixtures/CPU.20260521.185552.92535.0.001.cpuprofile');
     const traceBuf = fs.readFileSync('test/fixtures/Trace-20260521T190407.json.gz');

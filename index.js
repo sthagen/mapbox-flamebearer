@@ -123,7 +123,7 @@ function buildThread({nodes, samples, timeDeltas, startTime}, name) {
         if (list) list.push(id);
         else nodeChildren.set(parent, [id]);
     }
-    return {name, sampleTimes, sampleFrames, startTime,
+    return {name, sampleTimes, sampleFrames, sampleIds: samples, startTime,
         nodes, nodeParent, nodeChildren, nodeSelfTime,
         ...aggregate(sampleTimes, sampleFrames, startTime, -Infinity, Infinity)};
 }
@@ -381,11 +381,20 @@ export function findStacks(thread, pattern) {
     const needle = pattern.toLowerCase();
     const totalOf = totalsCache(thread);
 
+    // V8 attributes all GC samples to one (garbage collector) node under (root), losing the
+    // JS context — so call-tree parents are useless. Reconstruct callers from temporal
+    // adjacency: each GC sample is attributed to the leaf of the preceding non-GC sample
+    // (this is what Speedscope's sandwich view does for GC).
+    if (needle === '(garbage collector)') return findGCStacks(thread);
+
     // Exact match on functionName (case-insensitive); use --grep for substring/regex search.
-    // Group by full frame identity so same name in different files = separate groups.
+    // Empty functionName matches "(anonymous)" — V8 stores it as "" but we display it as
+    // "(anonymous)", so users target the displayed name. Group by full frame identity, so
+    // same name in different files (or each distinct anonymous site) = separate groups.
     const groups = new Map();
     for (const n of nodes.values()) {
-        if (n.callFrame?.functionName?.toLowerCase() !== needle) continue;
+        const name = (n.callFrame?.functionName || '(anonymous)').toLowerCase();
+        if (name !== needle) continue;
         const key = frameKey(n.callFrame);
         let g = groups.get(key);
         if (!g) {
@@ -416,6 +425,41 @@ export function findStacks(thread, pattern) {
         delete g.matchingIds;
     }
     return [...groups.values()].filter(g => g.total >= noiseUs).sort((a, b) => b.total - a.total);
+}
+
+function findGCStacks(thread) {
+    const {nodes, nodeSelfTime, sampleIds, sampleFrames, sampleTimes, startTime} = thread;
+    let gcNode = null;
+    for (const n of nodes.values()) {
+        if (n.callFrame?.functionName === '(garbage collector)') { gcNode = n; break; }
+    }
+    if (!gcNode) return [];
+
+    const gcId = gcNode.id;
+    const callers = new Map();
+    let lastJsFrame = null;
+    let prev = startTime;
+    for (let i = 0; i < sampleIds.length; i++) {
+        const ts = sampleTimes[i];
+        const dt = ts - prev;
+        prev = ts;
+        if (sampleIds[i] === gcId) {
+            if (lastJsFrame) addFrame(callers, lastJsFrame, dt);
+        } else {
+            const f = sampleFrames[i];
+            if (f && !SYSTEM_NAMES.has(f.functionName)) lastJsFrame = f;
+        }
+    }
+    const total = nodeSelfTime.get(gcId) ?? 0;
+    // Floor against GC's own total, not thread busy: each caller is naturally a small
+    // fraction of a small total, and we want to see who's contributing to GC pressure.
+    const noiseUs = total * 0.03;
+    const callersList = [...callers.values()].filter(e => e.time >= noiseUs).sort((a, b) => b.time - a.time);
+    return [{
+        frame: gcNode.callFrame,
+        self: total, total, sites: 1,
+        callers: callersList, callees: [], hotPath: []
+    }];
 }
 
 function loadSiblingMap(url) {
