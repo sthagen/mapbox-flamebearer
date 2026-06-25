@@ -1,6 +1,6 @@
 # 🔥 flamebearer
 
-A CLI that summarizes CPU traces for AI agents and humans, designed for JavaScript performance optimization loops.
+A JavaScript CPU trace analysis tool for agents and humans. Designed for JavaScript performance optimization loops.
 
 Reads Chrome DevTools Performance recordings (`.json` / `.json.gz`) and Node `.cpuprofile` files,
 and prints a compact, structured text summary — top CPU offenders, hot source lines, long tasks, with a way to drill down further.
@@ -23,6 +23,52 @@ flamebearer CPU.*.cpuprofile
 ```
 
 With no flags you get a one-page summary per thread — the answer to "what should I look at in this trace" most of the time.
+
+<details>
+<summary>Sample output</summary>
+
+```
+Sources:
+ file:///Users/mourner/projects/supercluster/
+
+=== CPU.20260521.160113.74872.0.001 ===
+samples: 4277  busy: 5309.5 ms (99.9%)  idle: 6.2 ms
+
+Heaviest stacks: (% of thread busy)
+  83.6%  run → (anonymous) → load
+  63.2%    _cluster → withinInto
+  10.0%      sqDist
+  18.1%    _createTree → finish → sort
+  16.4%      sort → sort → sort
+  13.6%        sort
+
+Top CPU (self time):
+ 2511.9 ms  47.3%  withinInto  node_modules/kdbush/index.js:207
+  815.5 ms  15.3%  (garbage collector)
+  778.6 ms  14.6%  select  node_modules/kdbush/index.js:289
+  531.6 ms  10.0%  sqDist  node_modules/kdbush/index.js:358
+  316.8 ms   6.0%  _cluster  index.js:304
+  109.2 ms   2.1%  swap  node_modules/kdbush/index.js:346
+   48.3 ms   0.9%  (anonymous)  bench.js:1
+   36.9 ms   0.7%  compileForInternalLoader  node:internal/bootstrap/realm:383
+   35.7 ms   0.7%  swapItem  node_modules/kdbush/index.js:335
+   29.9 ms   0.6%  latY  index.js:451
+   27.1 ms   0.5%  load  index.js:44
+
+Hot lines (self time): (per source line; includes inlined code)
+ 711.3 ms  13.4%  node_modules/kdbush/index.js:241
+ 710.1 ms  13.4%  node_modules/kdbush/index.js:227
+ 373.0 ms   7.0%  node_modules/kdbush/index.js:315
+ 331.0 ms   6.2%  node_modules/kdbush/index.js:226
+ 311.1 ms   5.9%  node_modules/kdbush/index.js:314
+ 310.6 ms   5.8%  node_modules/kdbush/index.js:360
+ 279.2 ms   5.3%  node_modules/kdbush/index.js:244
+ 109.8 ms   2.1%  node_modules/kdbush/index.js:359
+ 109.8 ms   2.1%  node_modules/kdbush/index.js:361
+  84.4 ms   1.6%  index.js:379
+```
+
+</details>
 
 ### Drilling down
 
