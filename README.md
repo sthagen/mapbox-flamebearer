@@ -1,10 +1,9 @@
 # 🔥 flamebearer
 
-A JavaScript CPU trace analysis tool for agents and humans. Designed for JavaScript performance optimization loops.
+A JavaScript CPU trace analysis tool for agents and humans. Designed for performance optimization loops.
 
 Reads Chrome DevTools Performance recordings (`.json` / `.json.gz`) and Node `.cpuprofile` files,
 and prints a compact, structured text summary — top CPU offenders, hot source lines, long tasks, with a way to drill down further.
-
 No HTML, no GUI: [Speedscope](https://www.speedscope.app/) already nails that.
 
 ## Usage
@@ -12,17 +11,13 @@ No HTML, no GUI: [Speedscope](https://www.speedscope.app/) already nails that.
 ```bash
 npm install -g flamebearer
 
-# Profile a Node script (wraps `node --cpu-prof`)
-flamebearer-node bench.js
+flamebearer-node bench.js    # profile a script
 
-# Summarize a Chrome DevTools trace (.json / .json.gz)
-flamebearer profile.json.gz
-
-# Summarize a `node --cpu-prof` trace (one or more files or a folder)
-flamebearer CPU.*.cpuprofile
+flamebearer profile.json.gz  # summarize a Chrome DevTools trace
+flamebearer CPU.*.cpuprofile # summarize node --cpu-prof trace (one or more files or a folder)
 ```
 
-With no flags you get a one-page summary per thread — the answer to "what should I look at in this trace" most of the time.
+With no flags, you get a one-page summary per thread — the answer to “what should I look at in this trace”.
 
 <details>
 <summary>Sample output</summary>
@@ -73,9 +68,9 @@ Hot lines (self time): (per source line; includes inlined code)
 ### Drilling down
 
 ```bash
-flamebearer trace.json --stacks load          # summary for a specific function
-flamebearer trace.json --thread main --top 30 # restrict threads, more rows
-flamebearer trace.json --from 1200 --to 1800  # slice a time range (ms)
+flamebearer trace.json --stacks load            # summary for a specific function
+flamebearer trace.json --thread main --top 30   # restrict threads, more rows
+flamebearer trace.json --from 1200 --to 1800    # slice a time range (ms)
 
 flamebearer-node bench.js arg1 -- --stacks load # pass drilldown flags to the Node wrapper
 ```
