@@ -1,6 +1,6 @@
 # 🔥 flamebearer
 
-A CLI that summarizes performance traces for AI agents and humans, designed for JavaScript performance optimization loops.
+A CLI that summarizes CPU traces for AI agents and humans, designed for JavaScript performance optimization loops.
 
 Reads Chrome DevTools Performance recordings (`.json` / `.json.gz`) and Node `.cpuprofile` files,
 and prints a compact, structured text summary — top CPU offenders, hot source lines, long tasks, with a way to drill down further.
@@ -12,20 +12,17 @@ No HTML, no GUI: [Speedscope](https://www.speedscope.app/) already nails that.
 ```bash
 npm install -g flamebearer
 
-# Profile a Node script in one step (wraps `node --cpu-prof`)
+# Profile a Node script (wraps `node --cpu-prof`)
 flamebearer-node bench.js
-flamebearer-node bench.js arg1 arg2 -- --top 30 --thread main
 
 # Summarize a Chrome DevTools trace (.json / .json.gz)
 flamebearer profile.json.gz
 
-# Summarize a Node CPU profile (one or more files or a folder)
-node --cpu-prof app.js
+# Summarize a `node --cpu-prof` trace (one or more files or a folder)
 flamebearer CPU.*.cpuprofile
 ```
 
-With no flags you get a one-page summary per thread — the answer to "what
-should I look at in this trace" most of the time.
+With no flags you get a one-page summary per thread — the answer to "what should I look at in this trace" most of the time.
 
 ### Drilling down
 
@@ -33,6 +30,8 @@ should I look at in this trace" most of the time.
 flamebearer trace.json --stacks parseConfig   # callers, callees, hot paths, and hot lines for one function
 flamebearer trace.json --thread main --top 30 # restrict threads, more rows
 flamebearer trace.json --from 1200 --to 1800  # slice a time range (ms)
+
+flamebearer-node bench.js arg1 arg2 -- --top 30 --thread main # pass drilldown flags to the Node wrapper
 ```
 
 Run `flamebearer --help` for the full flag list.
