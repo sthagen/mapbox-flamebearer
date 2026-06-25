@@ -6,15 +6,17 @@ Reads Chrome DevTools Performance recordings (`.json` / `.json.gz`) and Node `.c
 and prints a compact, structured text summary — top CPU offenders, hot source lines, long tasks, with a way to drill down further.
 No HTML, no GUI: [Speedscope](https://www.speedscope.app/) already nails that.
 
+[![Build Status](https://github.com/mourner/flamebearer/actions/workflows/node.yml/badge.svg)](https://github.com/mourner/flamebearer/actions) [![Simply Awesome](https://img.shields.io/badge/simply-awesome-brightgreen.svg)](https://github.com/mourner/projects)
+
 ## Usage
 
 ```bash
 npm install -g flamebearer
 
-flamebearer-node bench.js    # profile a script
+flamebearer-node bench.js     # profile a script
 
-flamebearer profile.json.gz  # summarize a Chrome DevTools trace
-flamebearer CPU.*.cpuprofile # summarize node --cpu-prof trace (one or more files or a folder)
+flamebearer profile.json.gz   # summarize a Chrome DevTools trace
+flamebearer CPU.*.cpuprofile  # summarize node --cpu-prof trace (one or more files or a folder)
 ```
 
 With no flags, you get a one-page summary per thread — the answer to “what should I look at in this trace”.
@@ -68,11 +70,11 @@ Hot lines (self time): (per source line; includes inlined code)
 ### Drilling down
 
 ```bash
-flamebearer trace.json --stacks load            # summary for a specific function
-flamebearer trace.json --thread main --top 30   # restrict threads, more rows
-flamebearer trace.json --from 1200 --to 1800    # slice a time range (ms)
+flamebearer trace.json --stacks load             # summary for a specific function
+flamebearer trace.json --thread main --top 30    # restrict threads, more rows
+flamebearer trace.json --from 1200 --to 1800     # slice a time range (ms)
 
-flamebearer-node bench.js arg1 -- --stacks load # pass drilldown flags to the Node wrapper
+flamebearer-node bench.js arg1 -- --stacks load  # pass drilldown flags to the Node wrapper
 ```
 
 Run `flamebearer --help` for the full flag list.
