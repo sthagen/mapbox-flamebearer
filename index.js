@@ -569,7 +569,13 @@ export function findStacks(thread, pattern) {
         g.callees = sortDesc(g.callees);
         delete g.matchingIds;
     }
-    return [...groups.values()].filter(g => g.total >= noiseUs).sort((a, b) => b.total - a.total);
+    const all = [...groups.values()].sort((a, b) => b.total - a.total);
+    // Drop incidental tiny matches — but if the explicitly-named function is *only* present
+    // below the noise floor, still show it. Returning empty here reads as "no such function"
+    // (the report says "no exact match"), yet suggestNames has no floor and would list the
+    // name as its own closest match — a confusing contradiction.
+    const significant = all.filter(g => g.total >= noiseUs);
+    return significant.length ? significant : all;
 }
 
 function findGCStacks(thread) {
