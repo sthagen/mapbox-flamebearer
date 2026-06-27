@@ -29,7 +29,10 @@
     "profiling",
     "v8",
     "node",
-    "traces"
+    "traces",
+    "cpuprofile",
+    "agent",
+    "llm"
   ],
   "author": "Volodymyr Agafonkin",
   "license": "ISC",

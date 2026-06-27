@@ -7,7 +7,8 @@ import {fileURLToPath} from 'node:url';
 
 const HELP = `usage: flamebearer-node [node-args...] script [script-args...] [-- flamebearer-args...]
 
-Profiles a node script and renders the result with flamebearer.
+Profiles a Node script and prints a plain-text CPU summary (top offenders,
+hot source lines, heaviest stacks) for terminals and AI agents.
 
 examples:
   flamebearer-node bench.js

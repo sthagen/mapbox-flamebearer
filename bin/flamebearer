@@ -4,6 +4,9 @@ import {loadInputs, formatReport} from '../index.js';
 
 const HELP = `usage: flamebearer <input>... [options]
 
+Reads a CPU trace and prints a plain-text summary (top offenders,
+hot source lines, heaviest stacks) for terminals and AI agents.
+
 inputs: .json / .json.gz Chrome trace, .cpuprofile, or a directory of
         .cpuprofile files. Multiple inputs merge as additional threads.
 
